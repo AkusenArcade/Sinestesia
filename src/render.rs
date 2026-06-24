@@ -603,26 +603,78 @@ fn build_bar_vertices(left: &SpectrumFrame, right: &SpectrumFrame, palette: &Pal
     v
 }
 
-/// Curva continua e speculare dello spettro come area riempita
-/// (TRIANGLE_STRIP unico dal bordo sinistro al destro passando per il centro).
-/// Base trasparente, cima opaca.
-fn build_line_vertices(left: &SpectrumFrame, right: &SpectrumFrame, palette: &Palette) -> Vec<f32> {
-    let mut v = Vec::with_capacity((NUM_BANDS * 2) * 2 * VERT_FLOATS);
-    let ca = palette.color_a;
-    let cb = palette.color_b;
-    let denom = (NUM_BANDS as f32 - 1.0).max(1.0);
+/// Suddivisioni per segmento nello smoothing spline (look più morbido).
+const SMOOTH_SUBDIV: usize = 8;
 
-    let column = |v: &mut Vec<f32>, x: f32, h: f32| {
-        let y_t = -1.0 + 2.0 * h.clamp(0.0, 1.0);
-        v.extend_from_slice(&[x, -1.0, ca.r, ca.g, ca.b, 0.0]);
-        v.extend_from_slice(&[x, y_t, cb.r, cb.g, cb.b, 1.0]);
+/// Punto di una spline di Catmull-Rom tra `p1` e `p2` (controlli `p0`,`p3`).
+fn catmull_rom(p0: (f32, f32), p1: (f32, f32), p2: (f32, f32), p3: (f32, f32), t: f32) -> (f32, f32) {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let f = |a: f32, b: f32, c: f32, d: f32| {
+        0.5 * ((2.0 * b)
+            + (-a + c) * t
+            + (2.0 * a - 5.0 * b + 4.0 * c - d) * t2
+            + (-a + 3.0 * b - 3.0 * c + d) * t3)
     };
+    (f(p0.0, p1.0, p2.0, p3.0), f(p0.1, p1.1, p2.1, p3.1))
+}
 
+/// Interpola una polilinea con spline di Catmull-Rom, restituendo punti
+/// suddivisi (curva morbida). `closed` tratta la curva come anello chiuso.
+fn smooth_curve(pts: &[(f32, f32)], closed: bool) -> Vec<(f32, f32)> {
+    let n = pts.len();
+    if n < 3 {
+        return pts.to_vec();
+    }
+    let get = |i: isize| -> (f32, f32) {
+        if closed {
+            pts[(i.rem_euclid(n as isize)) as usize]
+        } else {
+            pts[i.clamp(0, n as isize - 1) as usize]
+        }
+    };
+    let seg_count = if closed { n } else { n - 1 };
+    let mut out = Vec::with_capacity(seg_count * SMOOTH_SUBDIV + 1);
+    for i in 0..seg_count {
+        let p0 = get(i as isize - 1);
+        let p1 = get(i as isize);
+        let p2 = get(i as isize + 1);
+        let p3 = get(i as isize + 2);
+        for s in 0..SMOOTH_SUBDIV {
+            let t = s as f32 / SMOOTH_SUBDIV as f32;
+            out.push(catmull_rom(p0, p1, p2, p3, t));
+        }
+    }
+    if !closed {
+        out.push(pts[n - 1]);
+    }
+    out
+}
+
+/// Punti della curva speculare della linea: (x, y_cima), centro = basse.
+fn line_curve_points(left: &SpectrumFrame, right: &SpectrumFrame) -> Vec<(f32, f32)> {
+    let denom = (NUM_BANDS as f32 - 1.0).max(1.0);
+    let mut pts = Vec::with_capacity(NUM_BANDS * 2);
     for i in (0..NUM_BANDS).rev() {
-        column(&mut v, -(i as f32 / denom), left[i]);
+        pts.push((-(i as f32 / denom), -1.0 + 2.0 * left[i].clamp(0.0, 1.0)));
     }
     for i in 0..NUM_BANDS {
-        column(&mut v, i as f32 / denom, right[i]);
+        pts.push((i as f32 / denom, -1.0 + 2.0 * right[i].clamp(0.0, 1.0)));
+    }
+    pts
+}
+
+/// Curva continua e speculare dello spettro come area riempita (TRIANGLE_STRIP),
+/// con smoothing spline per un profilo morbido. Base trasparente, cima opaca.
+fn build_line_vertices(left: &SpectrumFrame, right: &SpectrumFrame, palette: &Palette) -> Vec<f32> {
+    let ca = palette.color_a;
+    let cb = palette.color_b;
+    let pts = smooth_curve(&line_curve_points(left, right), false);
+    let mut v = Vec::with_capacity(pts.len() * 2 * VERT_FLOATS);
+    for (x, y) in pts {
+        let y_t = y.max(-1.0);
+        v.extend_from_slice(&[x, -1.0, ca.r, ca.g, ca.b, 0.0]);
+        v.extend_from_slice(&[x, y_t, cb.r, cb.g, cb.b, 1.0]);
     }
     v
 }
@@ -728,16 +780,7 @@ fn build_line_spectrum(
     right: &SpectrumFrame,
     palette: &Palette,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    let denom = (NUM_BANDS as f32 - 1.0).max(1.0);
-    let mut pts = Vec::with_capacity(NUM_BANDS * 2);
-    for i in (0..NUM_BANDS).rev() {
-        let x = -(i as f32 / denom);
-        pts.push((x, -1.0 + 2.0 * left[i].clamp(0.0, 1.0)));
-    }
-    for i in 0..NUM_BANDS {
-        let x = i as f32 / denom;
-        pts.push((x, -1.0 + 2.0 * right[i].clamp(0.0, 1.0)));
-    }
+    let pts = smooth_curve(&line_curve_points(left, right), false);
     let bases: Vec<(f32, f32)> = pts.iter().map(|p| (p.0, -1.0)).collect();
     let vis = peak_level(left, right);
     (
@@ -758,14 +801,12 @@ fn build_radial_spectrum(
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let pi = std::f32::consts::PI;
     let denom = denom_bands();
-    let mut pts = Vec::with_capacity(NUM_BANDS * 2);
-    let mut bases = Vec::with_capacity(NUM_BANDS * 2);
+    let mut raw = Vec::with_capacity(NUM_BANDS * 2);
 
     let mut add = |ang: f32, h: f32| {
         let r = RADIAL_INNER + h.clamp(0.0, 1.0) * 0.62;
         let (s, c) = ang.sin_cos();
-        pts.push((c * r * inv_aspect, s * r));
-        bases.push((c * RADIAL_INNER * inv_aspect, s * RADIAL_INNER));
+        raw.push((c * r * inv_aspect, s * r));
     };
     // Semicerchio destro: basse in alto (90°) → alte in basso (-90°).
     for i in 0..NUM_BANDS {
@@ -777,6 +818,17 @@ fn build_radial_spectrum(
         let t = i as f32 / denom;
         add(std::f32::consts::FRAC_PI_2 + t * pi, left[i]);
     }
+
+    let pts = smooth_curve(&raw, true);
+    // Base = proiezione di ciascun punto sull'anello interno (direzione radiale).
+    let bases: Vec<(f32, f32)> = pts
+        .iter()
+        .map(|&(px, py)| {
+            let sx = px / inv_aspect;
+            let len = (sx * sx + py * py).sqrt().max(1e-6);
+            (sx / len * RADIAL_INNER * inv_aspect, py / len * RADIAL_INNER)
+        })
+        .collect();
     let vis = peak_level(left, right);
     (
         build_fill(&pts, &bases, palette, true),

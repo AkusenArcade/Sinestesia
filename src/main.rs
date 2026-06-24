@@ -34,6 +34,8 @@ struct App {
     buffer: Arc<AudioBuffer>,
     /// Sessione di cattura attiva (None solo transitoriamente).
     audio: Option<AudioHandle>,
+    /// Watcher del file tema matugen (noctalia.css), per il live reload colori.
+    _theme_watcher: Option<notify::RecommendedWatcher>,
 }
 
 /// Messaggi dell'applicazione.
@@ -90,7 +92,7 @@ fn palette_for(settings: &Settings) -> Palette {
             color_a: settings.color_a,
             color_b: settings.color_b,
         },
-        ColorMode::Auto => theme::accent_palette(),
+        ColorMode::Auto => theme::auto_palette(),
     }
 }
 
@@ -263,15 +265,24 @@ impl SimpleComponent for App {
         let buffer = AudioBuffer::new(dsp::FFT_SIZE * 2);
         let audio = Some(audio::start(buffer.clone(), settings.source));
 
+        // Osserva il file tema matugen (noctalia.css): in Auto la palette si
+        // aggiorna live quando cambia il tema di sistema.
+        let theme_watcher = {
+            let input = sender.input_sender().clone();
+            theme::watch_theme(move || {
+                let _ = input.send(Msg::ReloadAutoTheme);
+            })
+        };
+
         let model = App {
             settings,
             viz: viz.clone(),
             buffer: buffer.clone(),
             audio,
+            _theme_watcher: theme_watcher,
         };
 
-        // Segue l'accent color di sistema: quando cambia il tema
-        // (matugen/noctalia), in modalità Auto la palette si aggiorna live.
+        // Anche un eventuale cambio dell'accent color di sistema aggiorna i colori.
         adw::StyleManager::default().connect_accent_color_rgba_notify({
             let sender = sender.clone();
             move |_| sender.input(Msg::ReloadAutoTheme)
@@ -331,7 +342,7 @@ impl SimpleComponent for App {
             Msg::ReloadAutoTheme => {
                 if self.settings.color_mode == ColorMode::Auto {
                     self.apply_palette();
-                    log::info!("accent color di sistema aggiornato");
+                    log::info!("colori tema (matugen) aggiornati");
                 }
                 return; // nessuna impostazione da salvare
             }
