@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Sinestesia
+GenericName=Visualizzatore audio
+Comment=Visualizzatore audio per Linux con effetti e theming di sistema
+Exec=sinestesia
+Icon=dev.akusen.sinestesia
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=audio;visualizer;visualizzatore;spectrum;spettro;music;musica;
+StartupWMClass=dev.akusen.sinestesia
+StartupNotify=true

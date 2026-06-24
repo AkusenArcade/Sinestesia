@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="barGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f2b7c4"/>
+      <stop offset="1" stop-color="#d5bbff"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#d5bbff" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#d5bbff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Sfondo scuro arrotondato (in linea con la surface di noctalia) -->
+  <rect x="0" y="0" width="512" height="512" rx="112" ry="112" fill="#161217"/>
+  <circle cx="256" cy="256" r="210" fill="url(#glow)"/>
+
+  <!-- Barre dello spettro: montagna simmetrica (centro = basse) -->
+  <g fill="url(#barGrad)">
+    <rect x="84"  y="296" width="40" height="104" rx="14"/>
+    <rect x="140" y="240" width="40" height="160" rx="14"/>
+    <rect x="196" y="176" width="40" height="224" rx="14"/>
+    <rect x="252" y="128" width="40" height="272" rx="14"/>
+    <rect x="308" y="176" width="40" height="224" rx="14"/>
+    <rect x="364" y="240" width="40" height="160" rx="14"/>
+    <rect x="420" y="296" width="40" height="104" rx="14"/>
+  </g>
+
+  <!-- Puntini di luce (particelle) -->
+  <g fill="#ffffff">
+    <circle cx="150" cy="206" r="5" opacity="0.9"/>
+    <circle cx="272" cy="96"  r="6" opacity="0.95"/>
+    <circle cx="346" cy="150" r="4" opacity="0.8"/>
+    <circle cx="206" cy="138" r="4" opacity="0.85"/>
+    <circle cx="392" cy="214" r="5" opacity="0.8"/>
+  </g>
+</svg>
