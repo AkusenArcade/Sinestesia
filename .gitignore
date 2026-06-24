@@ -4,3 +4,6 @@
 # Editor / OS
 *.swp
 .DS_Store
+
+# Screenshot originali (non versionati)
+/Screenshots

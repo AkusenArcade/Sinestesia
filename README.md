@@ -6,6 +6,20 @@ tempo reale (FFT) e lo rende con effetti fluidi su **OpenGL** (GtkGLArea).
 
 ![icona](assets/sinestesia.svg)
 
+## Screenshot
+
+I cinque effetti, ciascuno con un tema (colori automatici) e uno sfondo diversi:
+
+| Barre | Linea |
+|:-:|:-:|
+| ![Barre](assets/screenshots/bars.png) | ![Linea](assets/screenshots/line.png) |
+| **Radiale** | **Radiale Spettro** |
+| ![Radiale](assets/screenshots/radial.png) | ![Radiale Spettro](assets/screenshots/radialspectrum.png) |
+
+**Linea Spettro** — variante neon, bordo luminoso a visibilità proporzionale al volume:
+
+![Linea Spettro](assets/screenshots/linespectrum.png)
+
 ## Caratteristiche
 
 - **Effetti** selezionabili a runtime:
