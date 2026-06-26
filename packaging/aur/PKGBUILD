@@ -1,0 +1,32 @@
+# Maintainer: Akusen <akudesyn@gmail.com>
+pkgname=sinestesia
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Visualizzatore audio per Linux con effetti e theming di sistema (Rust + GTK4)"
+arch=('x86_64')
+url="https://github.com/AkusenArcade/Sinestesia"
+license=('MIT')
+depends=('gtk4' 'libadwaita' 'pipewire' 'libepoxy' 'hicolor-icon-theme')
+makedepends=('cargo')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "Sinestesia-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "Sinestesia-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+package() {
+  cd "Sinestesia-$pkgver"
+  install -Dm755 "target/release/sinestesia"     "$pkgdir/usr/bin/sinestesia"
+  install -Dm644 "dev.akusen.sinestesia.desktop" "$pkgdir/usr/share/applications/dev.akusen.sinestesia.desktop"
+  install -Dm644 "assets/sinestesia.svg"         "$pkgdir/usr/share/icons/hicolor/scalable/apps/dev.akusen.sinestesia.svg"
+  install -Dm644 "LICENSE"                        "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
