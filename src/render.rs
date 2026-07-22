@@ -12,7 +12,10 @@
 
 use crate::audio::{AudioBuffer, Channel};
 use crate::config::{Effect, Rgb};
-use crate::dsp::{Analyzer, ImagingAnalyzer, ImagingFrame, SpectrumFrame, NUM_BANDS};
+use crate::dsp::{
+    band_center_hz, Analyzer, ImagingAnalyzer, ImagingFrame, SpectrumFrame, NUM_BANDS,
+    STAGE_HALF_ANGLE,
+};
 use glow::HasContext;
 use gtk::glib;
 use gtk::prelude::*;
@@ -48,6 +51,9 @@ pub struct VizState {
     /// Immagine stereo, calcolata solo quando l'effetto Imaging è attivo
     /// (richiede due FFT extra per frame).
     pub imaging: ImagingFrame,
+    /// Traiettoria mid/side per banda dell'ultimo frame, popolata solo
+    /// dall'effetto Fase (è l'unico che legge i campioni grezzi, non lo spettro).
+    pub phase_seg: [PhaseSample; PHASE_SEG],
     pub palette: Palette,
     pub gain: f32,
     pub effect: Effect,
@@ -63,6 +69,7 @@ impl Default for VizState {
             spectrum_left: [0.0; NUM_BANDS],
             spectrum_right: [0.0; NUM_BANDS],
             imaging: ImagingFrame::default(),
+            phase_seg: [[(0.0, 0.0); PHASE_GROUPS]; PHASE_SEG],
             palette: Palette::default(),
             gain: 1.0,
             effect: Effect::Bars,
@@ -131,6 +138,7 @@ pub fn build_gl_area(audio: Arc<AudioBuffer>, state: Rc<RefCell<VizState>>) -> g
                     &st.spectrum_left,
                     &st.spectrum_right,
                     &st.imaging,
+                    &st.phase_seg,
                     &st.palette,
                     st.effect,
                     w,
@@ -147,6 +155,7 @@ pub fn build_gl_area(audio: Arc<AudioBuffer>, state: Rc<RefCell<VizState>>) -> g
     let analyzer_l = Rc::new(RefCell::new(Analyzer::new()));
     let analyzer_r = Rc::new(RefCell::new(Analyzer::new()));
     let analyzer_img = Rc::new(RefCell::new(ImagingAnalyzer::new()));
+    let phase_filter = Rc::new(RefCell::new(PhaseFilter::new(crate::audio::SAMPLE_RATE)));
     area.add_tick_callback({
         let state = state.clone();
         move |area, _clock| {
@@ -164,12 +173,19 @@ pub fn build_gl_area(audio: Arc<AudioBuffer>, state: Rc<RefCell<VizState>>) -> g
             // Le due FFT dell'imaging costano, quindi solo quando serve.
             let imaging = (effect == Effect::Imaging)
                 .then(|| analyzer_img.borrow_mut().analyze(&audio, gain));
+            // La fase legge la forma d'onda, non lo spettro: la si campiona
+            // solo quando serve davvero.
+            let phase = (effect == Effect::Phase)
+                .then(|| phase_filter.borrow_mut().sample(&audio, gain));
             {
                 let mut s = state.borrow_mut();
                 s.spectrum_left = left;
                 s.spectrum_right = right;
                 if let Some(img) = imaging {
                     s.imaging = img;
+                }
+                if let Some(seg) = phase {
+                    s.phase_seg = seg;
                 }
             }
             area.queue_render();
@@ -338,6 +354,24 @@ struct Renderer {
     solid: SolidMesh,
     /// Estrusione corrente di ogni faccia (calciata dai transienti).
     face_pop: Vec<f32>,
+    /// Creste del rilievo, dalla più vicina alla più lontana.
+    terrain: std::collections::VecDeque<TerrainRow>,
+    /// Picco dello spettro accumulato in attesa della prossima cresta: senza
+    /// peak-hold, emettendo una cresta ogni tre frame, due terzi dei transienti
+    /// finirebbero tra un campione e l'altro.
+    ter_peak: [f32; TER_COLS],
+    ter_punch: f32,
+    /// Frazione di avanzamento verso la cresta successiva: muove il terreno con
+    /// continuità invece che a scatti di tre frame.
+    ter_phase: f32,
+    ter_time: f32,
+    /// Traiettoria del vettorscopio, dal punto più recente al più vecchio.
+    phase_pts: std::collections::VecDeque<PhaseSample>,
+    phase_time: f32,
+    /// Geometria statica della nebulosa e onde d'urto attive.
+    nebula: NebulaMesh,
+    shocks: Vec<Shock>,
+    nebula_time: f32,
     solid_spin: f32,
     solid_time: f32,
     /// Inviluppo lento dei bassi: serve a isolare i transienti (un colpo di
@@ -401,6 +435,18 @@ impl Renderer {
                 face_pop,
                 solid_spin: 0.0,
                 solid_time: 0.0,
+                terrain: std::collections::VecDeque::with_capacity(TER_ROWS + 1),
+                ter_peak: [0.0; TER_COLS],
+                ter_punch: 0.0,
+                ter_phase: 0.0,
+                ter_time: 0.0,
+                phase_pts: std::collections::VecDeque::with_capacity(
+                    PHASE_SEG * PHASE_TRAIL + PHASE_SEG,
+                ),
+                phase_time: 0.0,
+                nebula: NebulaMesh::new(),
+                shocks: Vec::new(),
+                nebula_time: 0.0,
                 bass_env: 0.0,
                 rng: 0x1234_5678,
                 prev_left: [0.0; NUM_BANDS],
@@ -426,6 +472,7 @@ impl Renderer {
         left: &SpectrumFrame,
         right: &SpectrumFrame,
         imaging: &ImagingFrame,
+        phase_seg: &[PhaseSample; PHASE_SEG],
         palette: &Palette,
         effect: Effect,
         width: i32,
@@ -560,6 +607,70 @@ impl Renderer {
                     self.gl.use_program(Some(self.glow_program));
                 }
                 self.draw_arrays(&pts, glow::POINTS, self.glow_pos_loc, self.glow_col_loc);
+            }
+            Effect::Nebula => {
+                let inv_aspect = height as f32 / width as f32;
+                let (yaw, pitch, dist) = self.update_nebula(left, right);
+                let pts = build_nebula(
+                    &self.nebula, left, right, &self.shocks, yaw, pitch, dist, palette,
+                    inv_aspect,
+                );
+                unsafe {
+                    self.gl.use_program(Some(self.glow_program));
+                    self.gl.blend_func(glow::ONE, glow::ONE);
+                }
+                self.draw_arrays(&pts, glow::POINTS, self.glow_pos_loc, self.glow_col_loc);
+            }
+            Effect::Phase => {
+                let inv_aspect = height as f32 / width as f32;
+                let (yaw, pitch, dist) = self.update_phase(phase_seg, left, right);
+                let ribbon = build_phase(
+                    &self.phase_pts,
+                    yaw,
+                    pitch,
+                    dist,
+                    palette,
+                    inv_aspect,
+                );
+
+                unsafe {
+                    self.gl.use_program(Some(self.tunnel_program));
+                    self.gl.blend_func(glow::ONE, glow::ONE);
+                }
+                self.draw_arrays(
+                    &ribbon,
+                    glow::TRIANGLE_STRIP,
+                    self.tunnel_pos_loc,
+                    self.tunnel_col_loc,
+                );
+            }
+            Effect::Terrain => {
+                let inv_aspect = height as f32 / width as f32;
+                let (dist, cam_x) = self.update_terrain(left, right);
+                let (fill, ribbons) = build_terrain(
+                    &self.terrain,
+                    self.ter_phase,
+                    dist,
+                    cam_x,
+                    palette,
+                    inv_aspect,
+                );
+
+                unsafe {
+                    self.gl.use_program(Some(self.program));
+                    self.gl.blend_func(glow::ONE, glow::ONE);
+                }
+                self.draw_arrays(&fill, glow::TRIANGLE_STRIP, self.pos_loc, self.col_loc);
+
+                unsafe {
+                    self.gl.use_program(Some(self.tunnel_program));
+                }
+                self.draw_arrays(
+                    &ribbons,
+                    glow::TRIANGLE_STRIP,
+                    self.tunnel_pos_loc,
+                    self.tunnel_col_loc,
+                );
             }
             Effect::Imaging => {
                 let inv_aspect = height as f32 / width as f32;
@@ -795,6 +906,109 @@ impl Renderer {
                 t: tint,
             });
         }
+    }
+
+    /// Fa avanzare la nebulosa e ritorna (yaw, pitch, distanza).
+    ///
+    /// I bassi accorciano la distanza (dolly, come poliedro e rilievo) e ogni
+    /// transiente forte lancia un'onda d'urto dal centro. Le onde si propagano
+    /// a velocità fissa e muoiono uscendo dalla superficie: farle nascere sul
+    /// solo `punch` sopra soglia evita che il continuo delle percussioni le
+    /// generi a raffica sovrapponendole in un unico rigonfiamento.
+    fn update_nebula(&mut self, left: &SpectrumFrame, right: &SpectrumFrame) -> (f32, f32, f32) {
+        let (bass, punch, gate) = self.audio_drive(left, right);
+        let dt = 1.0 / 60.0;
+        self.nebula_time += dt;
+
+        for sh in &mut self.shocks {
+            sh.front += NEB_SHOCK_SPEED * dt;
+        }
+        self.shocks.retain(|sh| sh.front < 1.0 + NEB_SHOCK_WIDTH * 3.0);
+        // Una sola onda per colpo: nasce quando il transiente supera la soglia e
+        // finché non rientra, così un rullo continuo non ne sputa una a frame.
+        if punch * gate > NEB_SHOCK_TRIGGER
+            && self.shocks.last().is_none_or(|sh| sh.front > 0.12)
+        {
+            self.shocks.push(Shock {
+                front: 0.0,
+                amp: (punch * gate).min(1.0),
+            });
+        }
+
+        let yaw = self.nebula_time * 0.17;
+        let pitch = 0.35 + (self.nebula_time * 0.11).sin() * 0.22;
+        let dist = NEB_DIST - (bass * 0.5 + punch * 0.6) * gate;
+        (yaw, pitch, dist)
+    }
+
+    /// Fa avanzare il rilievo di un frame e ritorna (distanza della camera,
+    /// spostamento laterale della camera).
+    ///
+    /// I bassi accorciano la distanza — stesso dolly del poliedro, parallasse
+    /// vera invece di uno zoom — mentre il lento sbandamento laterale serve a
+    /// non far leggere la griglia come un disegno piatto e simmetrico.
+    fn update_terrain(&mut self, left: &SpectrumFrame, right: &SpectrumFrame) -> (f32, f32) {
+        let (bass, punch, gate) = self.audio_drive(left, right);
+        self.ter_time += 1.0 / 60.0;
+
+        for (i, peak) in self.ter_peak.iter_mut().enumerate() {
+            let (is_right, t) = terrain_column(i);
+            let sp = if is_right { right } else { left };
+            *peak = peak.max(sample_spectrum(sp, t));
+        }
+        self.ter_punch = self.ter_punch.max(punch * gate);
+
+        self.ter_phase += TER_EMIT_RATE;
+        while self.ter_phase >= 1.0 {
+            self.ter_phase -= 1.0;
+            let mut h = self.ter_peak;
+            smooth_row(&mut h);
+            if let Some(prev) = self.terrain.front() {
+                for (i, v) in h.iter_mut().enumerate() {
+                    *v += (prev.h[i] - *v) * TER_TIME_SMOOTH;
+                }
+            }
+            self.terrain.push_front(TerrainRow {
+                h,
+                punch: self.ter_punch,
+            });
+            self.ter_peak = [0.0; TER_COLS];
+            self.ter_punch = 0.0;
+            if self.terrain.len() > TER_ROWS {
+                self.terrain.pop_back();
+            }
+        }
+
+        let dist = TER_DIST - (bass * 0.22 + punch * 0.28) * gate;
+        let cam_x = (self.ter_time * 0.17).sin() * 0.13;
+        (dist, cam_x)
+    }
+
+    /// Accoda la traiettoria del frame e ritorna (yaw, pitch, distanza).
+    ///
+    /// La camera oscilla lentamente su due assi: da un solo punto di vista il
+    /// nastro si leggerebbe come una figura piatta, ed è proprio la terza
+    /// dimensione — il tempo — che vale la pena mostrare.
+    fn update_phase(
+        &mut self,
+        seg: &[PhaseSample; PHASE_SEG],
+        left: &SpectrumFrame,
+        right: &SpectrumFrame,
+    ) -> (f32, f32, f32) {
+        let (bass, punch, gate) = self.audio_drive(left, right);
+        self.phase_time += 1.0 / 60.0;
+
+        for &p in seg.iter() {
+            self.phase_pts.push_front(p);
+        }
+        while self.phase_pts.len() > PHASE_SEG * PHASE_TRAIL {
+            self.phase_pts.pop_back();
+        }
+
+        let yaw = (self.phase_time * 0.13).sin() * 0.38;
+        let pitch = 0.16 + (self.phase_time * 0.09).sin() * 0.10;
+        let dist = PHASE_DIST - (bass * 0.25 + punch * 0.35) * gate;
+        (yaw, pitch, dist)
     }
 
     /// Aggiorna l'animazione del poliedro e ritorna (yaw, pitch, distanza).
@@ -1664,68 +1878,75 @@ fn build_solid_points(
 // Effetto imaging stereo
 // ---------------------------------------------------------------------------
 
-/// Schiacciamento verticale del disco: vista dall'alto a 30° di elevazione,
-/// quindi il semiasse verticale dell'ellisse è sin(30°) di quello orizzontale.
-const IMG_TILT: f32 = 0.5;
-/// Raggio del disco (il "palco"), in spazio quadrato.
-const IMG_RADIUS: f32 = 0.70;
-/// Focale della prospettiva: più bassa = disco più "sfondato".
-const IMG_FOCAL: f32 = 3.6;
-/// Traslazione verticale, per centrare il disco nel riquadro.
-const IMG_Y_OFFSET: f32 = 0.10;
-/// Punti campionati lungo il perimetro e lungo il lobo direzionale.
-const IMG_STEPS: usize = 160;
-/// Raggio minimo del lobo (non collassa mai del tutto).
-const IMG_LOBE_MIN: f32 = 0.10;
+/// Raggio del semicerchio (il "palco"), in spazio quadrato.
+///
+/// Niente scorcio prospettico: mezzo disco visto di taglio non si legge come
+/// un piano, si legge come una collina, e lo schiacciamento in profondità
+/// falsava anche le distanze angolari verso il fondo. Semicerchio regolare, con
+/// l'ascoltatore al centro e gli angoli tutti alla stessa scala.
+const IMG_RADIUS: f32 = 0.92;
+/// Traslazione verticale, per centrare il semicerchio nel riquadro.
+const IMG_Y_OFFSET: f32 = -IMG_RADIUS * 0.5;
+/// Punti campionati lungo l'arco frontale (estremi inclusi).
+const IMG_STEPS: usize = 129;
+/// Raggio del lobo a energia nulla: un punto sull'ascoltatore, non un
+/// semicerchio residuo — nel silenzio non arriva suono da nessuna direzione.
+const IMG_LOBE_MIN: f32 = 0.02;
 /// Semi-spessore dei ribbon dell'imaging.
 const IMG_RING_W: f32 = 0.006;
 const IMG_LOBE_W: f32 = 0.010;
+/// Larghezza angolare della macchia con cui viene spalmata una sorgente
+/// localizzata, in angolo **disegnato**: ~9°, stretta abbastanza da separare
+/// due strumenti panpottati diversi.
+const IMG_DIR_SPREAD: f32 = 0.16;
 
-/// Proietta un punto del piano orizzontale nella vista dall'alto a 30°.
+/// Fattore tra azimut reale e angolo disegnato.
 ///
-/// `x` = destra, `y` = profondità (positivo = lontano dall'osservatore).
-/// Ritorna (schermo x, schermo y, fattore prospettico).
-fn imaging_project(x: f32, y: f32) -> (f32, f32, f32) {
-    let s = IMG_FOCAL / (IMG_FOCAL + y);
-    (x * s, y * IMG_TILT * s + IMG_Y_OFFSET, s)
+/// L'arco **è** il palco stereo: i suoi estremi sono i due diffusori, non i
+/// ±90° fisici. Un pan estremo vive a ±30° veri (vedi [`STAGE_HALF_ANGLE`]),
+/// cioè dentro un terzo del semicerchio: disegnandolo lì l'intera immagine
+/// stereo si schiaccerebbe al centro e le differenze sarebbero illeggibili.
+/// La scala è uniforme, quindi le posizioni relative restano esatte — resta
+/// esatta anche la legge della tangente, applicata prima nel DSP.
+const IMG_STAGE_SCALE: f32 = std::f32::consts::FRAC_PI_2 / STAGE_HALF_ANGLE;
+
+/// Fasce di frequenza disegnate come lobi separati: bassi, medi, alti.
+const IMG_GROUPS: usize = 3;
+/// Confini tra le fasce, in Hz. 250 Hz è più o meno dove la lunghezza d'onda
+/// smette di superare la testa e la localizzazione comincia a funzionare;
+/// 4 kHz è dove finisce la regione in cui l'orecchio è più preciso.
+const IMG_SPLIT_HZ: [f32; IMG_GROUPS - 1] = [250.0, 4000.0];
+/// Posizione delle tre fasce sulla rampa di colore della palette.
+const IMG_GROUP_TINT: [f32; IMG_GROUPS] = [0.0, 0.5, 1.0];
+/// Ginocchio della saturazione del raggio del lobo, sull'energia media della
+/// fascia: più alto = il lobo arriva prima al bordo.
+const IMG_LOBE_KNEE: f32 = 4.5;
+/// Gamma della luminosità del lobo. Sotto 1 la curva è concava: parte da zero
+/// nel silenzio ma sale subito, così le energie medio-basse — dove sta quasi
+/// sempre il dettaglio direzionale — si vedono invece di restare sul fondo.
+const IMG_LOBE_GAMMA: f32 = 0.45;
+
+/// Azimut reale (radianti) → angolo sull'arco disegnato.
+fn imaging_display_angle(azimuth: f32) -> f32 {
+    (azimuth * IMG_STAGE_SCALE).clamp(-std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2)
 }
 
-/// Peso della componente diffusa a un dato angolo: nullo davanti, massimo
-/// dietro. L'energia decorrelata non ha una direzione, quindi la si distribuisce
-/// su tutto il cerchio addensandola alle spalle — dove l'ascoltatore percepisce
-/// l'ambienza. Non significa "il suono viene da dietro".
-fn diffuse_weight(angle: f32) -> f32 {
-    (1.0 - angle.cos()) * 0.5
+/// Posizione dell'ascoltatore sullo schermo: centro della corda.
+fn imaging_origin() -> (f32, f32) {
+    (0.0, IMG_Y_OFFSET)
 }
 
-/// Riflette un azimut frontale sull'arco posteriore secondo la stima
-/// fronte/retro, seguendo il cono di confusione: la posizione "gemella" di
-/// un azimut è il suo specchio rispetto all'asse laterale, cioè 45° ↔ 135°.
-///
-/// Con `rear = 0` l'angolo resta dov'è. Le posizioni puramente laterali (±90°)
-/// sono punti fissi, giustamente: lì fronte e retro coincidono.
-fn reflect_rear(azimuth: f32, rear: f32) -> f32 {
-    let sign = if azimuth < 0.0 { -1.0 } else { 1.0 };
-    let mag = azimuth.abs();
-    sign * (mag + rear * (std::f32::consts::PI - 2.0 * mag))
+/// Angolo dello slot `i` dell'arco frontale: da -π/2 (sinistra piena) a +π/2
+/// (destra piena), con 0 davanti.
+fn imaging_angle(i: usize) -> f32 {
+    let t = i as f32 / (IMG_STEPS - 1) as f32;
+    (t - 0.5) * std::f32::consts::PI
 }
 
-/// Punto del piano a un dato angolo e raggio, già proiettato.
-fn imaging_point(angle: f32, radius: f32) -> (f32, f32, f32) {
+/// Punto sullo schermo a un dato angolo e raggio, con 0 = davanti.
+fn imaging_point(angle: f32, radius: f32) -> (f32, f32) {
     let (s, c) = angle.sin_cos();
-    imaging_project(s * radius, c * radius)
-}
-
-/// Differenza angolare minima tra due angoli, in -π..π.
-fn angle_delta(a: f32, b: f32) -> f32 {
-    let tau = std::f32::consts::TAU;
-    let mut d = (a - b) % tau;
-    if d > std::f32::consts::PI {
-        d -= tau;
-    } else if d < -std::f32::consts::PI {
-        d += tau;
-    }
-    d
+    (s * radius, c * radius + IMG_Y_OFFSET)
 }
 
 /// Aggiunge alla lista un ribbon luminoso lungo una polilinea, con colore e
@@ -1784,123 +2005,184 @@ fn push_glow_ribbon(
     out.extend_from_slice(&strip);
 }
 
-/// Distribuzione angolare dell'energia (il "lobo") più la frequenza media che
-/// arriva da ogni direzione.
+/// Fascia di frequenza di una banda: 0 = bassi, 1 = medi, 2 = alti.
+fn imaging_group(b: usize) -> usize {
+    let f = band_center_hz(b);
+    IMG_SPLIT_HZ.iter().filter(|&&split| f >= split).count()
+}
+
+/// Distribuzione angolare dell'energia sull'arco frontale (i "lobi"), una per
+/// fascia di frequenza.
+///
+/// Tre lobi invece di uno perché la direzionalità dipende fortissimamente dalla
+/// frequenza: sotto i ~250 Hz la lunghezza d'onda supera la distanza tra le
+/// orecchie, i cue di localizzazione sono deboli e il mix tiene quasi sempre i
+/// bassi al centro, quindi un lobo unico veniva dominato dalla loro energia e
+/// nascondeva proprio la parte che *è* direzionale. Separati, il lobo dei bassi
+/// resta una cupola centrale e medi e alti mostrano da soli la provenienza.
 ///
 /// Ogni banda viene scomposta in due parti, come nell'analisi direzionale dei
 /// campi sonori: una **direzionale**, spalmata con un kernel gaussiano stretto
-/// attorno al proprio azimut, e una **diffusa**, distribuita su tutto il
-/// cerchio e addensata dietro. Il rapporto tra le due è la diffusività
-/// misurata dal modulo della coerenza.
-fn imaging_lobe(img: &ImagingFrame) -> ([f32; IMG_STEPS], [f32; IMG_STEPS]) {
-    let mut energy = [0.0f32; IMG_STEPS];
-    let mut tint = [0.0f32; IMG_STEPS];
-    let denom = denom_bands();
-    const DIR_SPREAD: f32 = 0.16;
-    let inv2s2 = 1.0 / (2.0 * DIR_SPREAD * DIR_SPREAD);
+/// attorno al proprio azimut, e una **diffusa**, stesa piatta su tutto l'arco.
+/// Il rapporto tra le due è la diffusività misurata dal modulo della coerenza.
+///
+/// La parte diffusa è piatta e non addensata da nessuna parte proprio perché è
+/// l'energia *senza* direzione: darle un lato sarebbe inventarsi una posizione.
+///
+/// Ogni lobo è mediato sulle **sue** bande, non sommato: le tre fasce non
+/// contengono lo stesso numero di bande e senza media la più larga vincerebbe
+/// per il solo fatto di essere più larga.
+fn imaging_lobes(img: &ImagingFrame) -> [[f32; IMG_STEPS]; IMG_GROUPS] {
+    let mut energy = [[0.0f32; IMG_STEPS]; IMG_GROUPS];
+    let mut counts = [0.0f32; IMG_GROUPS];
+    let inv2s2 = 1.0 / (2.0 * IMG_DIR_SPREAD * IMG_DIR_SPREAD);
 
     for b in 0..NUM_BANDS {
+        let g = imaging_group(b);
+        counts[g] += 1.0;
         let e = img.energy[b];
         if e <= 0.01 {
             continue;
         }
         let d = img.diffuseness[b].clamp(0.0, 1.0);
-        let (e_dir, e_diff) = (e * (1.0 - d), e * d);
-        let az = reflect_rear(img.azimuth[b], img.rear);
-        let t = b as f32 / denom;
+        let (e_dir, e_diff) = (e * (1.0 - d), e * d * 0.5);
+        let az = imaging_display_angle(img.azimuth[b]);
 
-        for (i, slot) in energy.iter_mut().enumerate() {
-            let a = i as f32 / IMG_STEPS as f32 * std::f32::consts::TAU;
-            let delta = angle_delta(a, az);
-            let w = e_dir * (-delta * delta * inv2s2).exp() + e_diff * diffuse_weight(a);
-            *slot += w;
-            tint[i] += w * t;
+        for (i, slot) in energy[g].iter_mut().enumerate() {
+            let delta = imaging_angle(i) - az;
+            *slot += e_dir * (-delta * delta * inv2s2).exp() + e_diff;
         }
     }
 
-    for i in 0..IMG_STEPS {
-        if energy[i] > 1e-6 {
-            tint[i] /= energy[i];
+    for (g, lobe) in energy.iter_mut().enumerate() {
+        let inv = 1.0 / counts[g].max(1.0);
+        for slot in lobe.iter_mut() {
+            *slot *= inv;
         }
     }
-    (energy, tint)
+    energy
 }
 
-/// Costruisce l'effetto imaging: riempimento del lobo, ribbon (anello di
-/// riferimento + tacche + lobo) e punti delle singole bande sul perimetro.
+/// Costruisce l'effetto imaging: riempimento del lobo, ribbon (arco frontale +
+/// tacche + lobo) e punti delle singole bande sull'arco.
+///
+/// La scena è un **semicerchio davanti all'ascoltatore**, che sta al centro
+/// della corda. Non c'è metà posteriore perché da due canali non è ricostruibile: il
+/// fronte/retro dipende dai cue spettrali del padiglione, che una registrazione
+/// stereo non porta con sé.
 fn build_imaging(
     img: &ImagingFrame,
     palette: &Palette,
     inv_aspect: f32,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    let tau = std::f32::consts::TAU;
-    let (lobe, tint) = imaging_lobe(img);
+    let lobes = imaging_lobes(img);
+    let (cx, cy) = imaging_origin();
 
-    // --- Anello di riferimento: il perimetro del palco. La luminosità cresce
-    // sul lato vicino, ed è questo a far leggere il disco come inclinato.
+    // --- Perimetro: solo l'arco frontale, aperto. La corda alla base non serve
+    // a leggere la scena e taglia in due i lobi che arrivano al bordo.
     let mut ring_pts = Vec::with_capacity(IMG_STEPS);
     let mut ring_cols = Vec::with_capacity(IMG_STEPS);
     let mut ring_w = Vec::with_capacity(IMG_STEPS);
-    for i in 0..IMG_STEPS {
-        let a = i as f32 / IMG_STEPS as f32 * tau;
-        let (x, y, s) = imaging_point(a, IMG_RADIUS);
-        ring_pts.push((x, y));
+    let ring_col = {
         let c = palette.color_a;
-        let k = 0.22 * s * s;
-        ring_cols.push((c.r * k, c.g * k, c.b * k));
-        ring_w.push(IMG_RING_W * s);
-    }
-
-    // --- Lobo direzionale: raggio = energia che arriva da quella direzione.
-    // Saturazione morbida, altrimenti il materiale denso lo sbatte al massimo.
-    let mut lobe_pts = Vec::with_capacity(IMG_STEPS);
-    let mut lobe_cols = Vec::with_capacity(IMG_STEPS);
-    let mut lobe_w = Vec::with_capacity(IMG_STEPS);
+        (c.r * 0.22, c.g * 0.22, c.b * 0.22)
+    };
     for i in 0..IMG_STEPS {
-        let a = i as f32 / IMG_STEPS as f32 * tau;
-        let v = 1.0 - (-lobe[i] * 0.55).exp();
-        let r = IMG_LOBE_MIN + v * (IMG_RADIUS - IMG_LOBE_MIN);
-        let (x, y, s) = imaging_point(a, r);
-        lobe_pts.push((x, y));
-        let c = mix(palette.color_a, palette.color_b, tint[i]);
-        let k = (0.30 + v * 0.85) * s * s;
-        lobe_cols.push((c.r * k, c.g * k, c.b * k));
-        lobe_w.push(IMG_LOBE_W * s);
+        ring_pts.push(imaging_point(imaging_angle(i), IMG_RADIUS));
+        ring_cols.push(ring_col);
+        ring_w.push(IMG_RING_W);
     }
 
+    // --- Un lobo per fascia: raggio = energia media che arriva da quella
+    // direzione. Saturazione morbida, altrimenti il materiale denso lo sbatte
+    // al massimo. Ogni lobo parte e finisce sull'ascoltatore, così il contorno
+    // segue esattamente il ventaglio del proprio riempimento.
     let mut ribbons = Vec::new();
-    push_glow_ribbon(&mut ribbons, &ring_pts, &ring_cols, &ring_w, true, inv_aspect);
-    push_glow_ribbon(&mut ribbons, &lobe_pts, &lobe_cols, &lobe_w, true, inv_aspect);
+    let mut fill = Vec::with_capacity(IMG_GROUPS * IMG_STEPS * 2 * VERT_FLOATS);
+    push_glow_ribbon(&mut ribbons, &ring_pts, &ring_cols, &ring_w, false, inv_aspect);
 
-    // --- Tacche di orientamento a fronte / destra / retro / sinistra: senza
-    // riferimenti fissi non si distingue davanti da dietro.
-    for q in 0..4 {
-        let a = q as f32 * std::f32::consts::FRAC_PI_2;
-        let (x0, y0, s0) = imaging_point(a, IMG_RADIUS * 1.02);
-        let (x1, y1, _) = imaging_point(a, IMG_RADIUS * (if q == 0 { 1.16 } else { 1.10 }));
+    for (g, lobe) in lobes.iter().enumerate() {
+        let c = mix(palette.color_a, palette.color_b, IMG_GROUP_TINT[g]);
+        let mut lobe_pts = vec![(cx, cy)];
+        let mut lobe_cols = vec![(0.0, 0.0, 0.0)];
+        let mut lobe_w = vec![IMG_LOBE_W];
+        let mut strip: Vec<f32> = Vec::with_capacity(IMG_STEPS * 2 * VERT_FLOATS);
+
+        for (i, &e) in lobe.iter().enumerate() {
+            let v = 1.0 - (-e * IMG_LOBE_KNEE).exp();
+            let r = IMG_LOBE_MIN + v * (IMG_RADIUS - IMG_LOBE_MIN);
+            let (x, y) = imaging_point(imaging_angle(i), r);
+            lobe_pts.push((x, y));
+            // Luminosità legata all'energia senza fondoscala costante: una
+            // direzione da cui non arriva nulla non lascia contorno e il lobo si
+            // spegne davvero, invece di restare un anello disegnato. La gamma
+            // evita che "niente fondoscala" significhi "quasi sempre invisibile".
+            let bright = v.powf(IMG_LOBE_GAMMA);
+            let k = bright * (0.55 + v * 0.65);
+            lobe_cols.push((c.r * k, c.g * k, c.b * k));
+            lobe_w.push(IMG_LOBE_W);
+
+            // Riempimento: ventaglio ascoltatore→curva. Tenue, perché i tre
+            // lobi si sovrappongono e il blending è additivo.
+            let f = bright * 0.10;
+            strip.extend_from_slice(&[cx * inv_aspect, cy, 0.0, 0.0, 0.0, 1.0]);
+            strip.extend_from_slice(&[x * inv_aspect, y, c.r * f, c.g * f, c.b * f, 1.0]);
+        }
+
+        lobe_pts.push((cx, cy));
+        lobe_cols.push((0.0, 0.0, 0.0));
+        lobe_w.push(IMG_LOBE_W);
+        push_glow_ribbon(
+            &mut ribbons,
+            &lobe_pts,
+            &lobe_cols,
+            &lobe_w,
+            false,
+            inv_aspect,
+        );
+
+        // I ventagli stanno in un'unica draw call, cuciti da triangoli
+        // degeneri come i ribbon.
+        if !fill.is_empty() {
+            let last: Vec<f32> = fill[fill.len() - VERT_FLOATS..].to_vec();
+            fill.extend_from_slice(&last);
+            fill.extend_from_slice(&strip[..VERT_FLOATS]);
+        }
+        fill.extend_from_slice(&strip);
+    }
+
+    // --- Tacche di riferimento, in angolo disegnato. Gli estremi dell'arco
+    // sono i due diffusori (pan tutto a sinistra / tutto a destra) e il centro
+    // è l'immagine centrale: sono i tre punti che si riconoscono a orecchio.
+    // Le due intermedie segnano il mezzo palco.
+    const TICKS: [(f32, bool); 5] = [
+        (-std::f32::consts::FRAC_PI_2, true),
+        (-std::f32::consts::FRAC_PI_4, false),
+        (0.0, true),
+        (std::f32::consts::FRAC_PI_4, false),
+        (std::f32::consts::FRAC_PI_2, true),
+    ];
+    for (a, strong) in TICKS {
+        let (x0, y0) = imaging_point(a, IMG_RADIUS * 1.02);
+        let out = if a == 0.0 {
+            1.18
+        } else if strong {
+            1.14
+        } else {
+            1.07
+        };
+        let (x1, y1) = imaging_point(a, IMG_RADIUS * out);
         let c = palette.color_a;
-        let k = 0.30 * s0 * s0;
+        let k = if strong { 0.34 } else { 0.16 };
         let col = (c.r * k, c.g * k, c.b * k);
         // Tre punti: `push_glow_ribbon` richiede una polilinea, non un segmento.
         let pts = [(x0, y0), ((x0 + x1) * 0.5, (y0 + y1) * 0.5), (x1, y1)];
         let cols = [col; 3];
-        let w = [IMG_RING_W * s0; 3];
+        let w = [IMG_RING_W; 3];
         push_glow_ribbon(&mut ribbons, &pts, &cols, &w, false, inv_aspect);
     }
 
-    // --- Riempimento del lobo: ventaglio centro→curva (TRIANGLE_STRIP).
-    let (cx, cy, _) = imaging_project(0.0, 0.0);
-    let mut fill = Vec::with_capacity((IMG_STEPS + 1) * 2 * VERT_FLOATS);
-    for k in 0..=IMG_STEPS {
-        let i = k % IMG_STEPS;
-        let (px, py) = lobe_pts[i];
-        let c = mix(palette.color_a, palette.color_b, tint[i]);
-        let f = 0.05 + (1.0 - (-lobe[i] * 0.55).exp()) * 0.10;
-        fill.extend_from_slice(&[cx * inv_aspect, cy, 0.0, 0.0, 0.0, 1.0]);
-        fill.extend_from_slice(&[px * inv_aspect, py, c.r * f, c.g * f, c.b * f, 1.0]);
-    }
-
-    // --- Una luce per banda sul perimetro, al proprio azimut. Le bande diffuse
+    // --- Una luce per banda sull'arco, al proprio azimut. Le bande diffuse
     // non hanno una direzione, quindi il punto sbiadisce con la diffusività:
     // segnare un punto preciso per del riverbero sarebbe una bugia.
     let denom = denom_bands();
@@ -1910,9 +2192,9 @@ fn build_imaging(
         if e <= 0.01 {
             continue;
         }
-        let (x, y, s) = imaging_point(reflect_rear(img.azimuth[b], img.rear), IMG_RADIUS);
+        let (x, y) = imaging_point(imaging_display_angle(img.azimuth[b]), IMG_RADIUS);
         let c = mix(palette.color_a, palette.color_b, b as f32 / denom);
-        let a = (e * s * s).clamp(0.0, 1.0);
+        let a = e.clamp(0.0, 1.0);
         dots.extend_from_slice(&[x * inv_aspect, y, c.r, c.g, c.b, a]);
     }
 
@@ -1922,6 +2204,523 @@ fn build_imaging(
 /// Denominatore per la rampa di frequenza nel radiale (evita /0).
 fn denom_bands() -> f32 {
     (NUM_BANDS as f32 - 1.0).max(1.0)
+}
+
+// ---------------------------------------------------------------------------
+// Effetto fase (vettorscopio esteso nel tempo)
+// ---------------------------------------------------------------------------
+
+/// Campioni grezzi letti a ogni frame: 800 a 48 kHz ≈ 16.7 ms, cioè esattamente
+/// quanto passa tra un frame e il successivo a 60 Hz. Meno lascerebbe buchi
+/// nella traiettoria, di più la farebbe ripetere.
+const PHASE_WIN: usize = 800;
+/// Punti in cui viene condensata la finestra. Ogni punto è la **media** del suo
+/// blocco, non un campione preso al volo: decimare senza filtrare farebbe
+/// rientrare le frequenze alte come rumore, e il nastro tremerebbe.
+const PHASE_SEG: usize = 48;
+/// Frame di traiettoria tenuti in scena: ~0.7 s di segnale.
+const PHASE_TRAIL: usize = 40;
+/// Passo in profondità tra due punti consecutivi.
+const PHASE_Z_STEP: f32 = 0.006;
+/// Ampiezza a schermo di un segnale a fondo scala.
+const PHASE_GAIN: f32 = 0.85;
+/// Lunghezza focale e distanza a riposo della camera.
+const PHASE_FOCAL: f32 = 1.6;
+const PHASE_DIST: f32 = 1.30;
+/// Semi-spessore del nastro nel punto più vicino.
+const PHASE_LINE_W: f32 = 0.0075;
+
+/// Bande in cui si separa la forma d'onda: bassi, medi, alti.
+const PHASE_GROUPS: usize = 3;
+/// Frequenze di taglio dei due crossover, in Hz.
+const PHASE_SPLIT_HZ: [f32; PHASE_GROUPS - 1] = [250.0, 2500.0];
+/// Posizione delle tre bande sulla rampa di colore della palette.
+const PHASE_GROUP_TINT: [f32; PHASE_GROUPS] = [0.0, 0.5, 1.0];
+/// Guadagno di disegno per banda. Bassi compatti al centro, medi e alti — meno
+/// energetici ma più larghi e mossi — spinti su per riempire il campo e far
+/// risaltare proprio la parte stereo che il singolo nastro nascondeva.
+const PHASE_GROUP_GAIN: [f32; PHASE_GROUPS] = [1.0, 1.7, 2.6];
+/// Fattore di scala del raggio dei tre nastri: il basso resta stretto attorno
+/// all'asse, medi e alti si allargano, così i tre non si sovrappongono in un
+/// unico groviglio.
+const PHASE_GROUP_RADIUS: [f32; PHASE_GROUPS] = [0.55, 1.0, 1.35];
+/// Rotazione del piano side/mid di ogni banda: 120° l'una dall'altra, così i
+/// tre nastri si aprono a ventaglio invece di stare tutti sull'asse verticale.
+const PHASE_GROUP_ROT: [f32; PHASE_GROUPS] = [
+    0.0,
+    std::f32::consts::TAU / 3.0,
+    2.0 * std::f32::consts::TAU / 3.0,
+];
+
+/// Un punto della traiettoria: (side, mid) per ciascuna banda.
+type PhaseSample = [(f32, f32); PHASE_GROUPS];
+
+/// Filtro di separazione in bande della forma d'onda stereo.
+///
+/// Tre one-pole in cascata per canale danno un crossover Linkwitz-povero ma
+/// sufficiente: `bassi = LP(250)`, `alti = segnale − LP(2500)`, `medi` quel che
+/// resta in mezzo. Lo stato **deve** persistere tra i frame: le finestre di
+/// 800 campioni sono contigue (16.7 ms a 60 Hz = esattamente un frame), quindi
+/// azzerare il filtro a ogni frame introdurrebbe un transiente ogni 800
+/// campioni — un ronzio a 60 Hz visibile come scatto del nastro.
+pub struct PhaseFilter {
+    /// Coefficienti dei due lowpass, precalcolati dalle frequenze di taglio.
+    alpha: [f32; PHASE_GROUPS - 1],
+    /// Stato dei lowpass, `[canale][crossover]`.
+    lp: [[f32; PHASE_GROUPS - 1]; 2],
+}
+
+impl PhaseFilter {
+    pub fn new(sample_rate: u32) -> Self {
+        let alpha = PHASE_SPLIT_HZ.map(|fc| {
+            let x = std::f32::consts::TAU * fc / sample_rate as f32;
+            1.0 - (-x).exp()
+        });
+        Self {
+            alpha,
+            lp: [[0.0; PHASE_GROUPS - 1]; 2],
+        }
+    }
+
+    /// Legge la finestra corrente e la condensa in [`PHASE_SEG`] campioni per
+    /// banda. Ogni campione è la **media** del suo blocco: mediare *dopo* aver
+    /// filtrato è anche l'antialiasing della decimazione, così i medi e gli alti
+    /// non rientrano come rumore.
+    pub fn sample(&mut self, audio: &AudioBuffer, gain: f32) -> [PhaseSample; PHASE_SEG] {
+        let mut l = vec![0.0f32; PHASE_WIN];
+        let mut r = vec![0.0f32; PHASE_WIN];
+        audio.snapshot(Channel::Left, &mut l);
+        audio.snapshot(Channel::Right, &mut r);
+
+        let block = PHASE_WIN / PHASE_SEG;
+        let mut out = [[(0.0f32, 0.0f32); PHASE_GROUPS]; PHASE_SEG];
+        for (k, slot) in out.iter_mut().enumerate() {
+            let mut acc = [(0.0f32, 0.0f32); PHASE_GROUPS];
+            for i in k * block..(k + 1) * block {
+                let lb = self.split(0, l[i]);
+                let rb = self.split(1, r[i]);
+                for g in 0..PHASE_GROUPS {
+                    acc[g].0 += (lb[g] - rb[g]) * 0.5; // side
+                    acc[g].1 += (lb[g] + rb[g]) * 0.5; // mid
+                }
+            }
+            let inv = gain / block as f32;
+            for g in 0..PHASE_GROUPS {
+                slot[g] = (
+                    (acc[g].0 * inv).clamp(-1.5, 1.5),
+                    (acc[g].1 * inv).clamp(-1.5, 1.5),
+                );
+            }
+        }
+        out
+    }
+
+    /// Scompone un campione di un canale nelle tre bande, avanzando i lowpass.
+    fn split(&mut self, ch: usize, x: f32) -> [f32; PHASE_GROUPS] {
+        let lp = &mut self.lp[ch];
+        lp[0] += self.alpha[0] * (x - lp[0]);
+        lp[1] += self.alpha[1] * (x - lp[1]);
+        [lp[0], lp[1] - lp[0], x - lp[1]]
+    }
+}
+
+/// Costruisce i nastri della traiettoria, uno per banda, cuciti in un'unica
+/// draw call. Ogni nastro parte dal punto più vecchio, in fondo, e arriva a
+/// quello appena suonato, in primo piano.
+///
+/// L'ordine non è estetico: senza z-buffer è l'ordine di disegno a decidere
+/// cosa copre cosa, quindi si parte dal fondo.
+fn build_phase(
+    trail: &std::collections::VecDeque<PhaseSample>,
+    yaw: f32,
+    pitch: f32,
+    dist: f32,
+    palette: &Palette,
+    inv_aspect: f32,
+) -> Vec<f32> {
+    let n = trail.len();
+    if n < 3 {
+        return Vec::new();
+    }
+    let s0 = PHASE_FOCAL / dist.max(0.4);
+    let mut out = Vec::new();
+    let mut poly = Vec::with_capacity(n);
+    let mut cols = Vec::with_capacity(n);
+    let mut widths = Vec::with_capacity(n);
+
+    for g in 0..PHASE_GROUPS {
+        let c = mix(palette.color_a, palette.color_b, PHASE_GROUP_TINT[g]);
+        let (bg, rg) = (PHASE_GROUP_GAIN[g], PHASE_GROUP_RADIUS[g]);
+        let (rs, rc) = PHASE_GROUP_ROT[g].sin_cos();
+        poly.clear();
+        cols.clear();
+        widths.clear();
+
+        for (k, sample) in trail.iter().rev().enumerate() {
+            let (side, mid) = sample[g];
+            let age = (n - 1 - k) as f32;
+            let z = age * PHASE_Z_STEP;
+            let amp2d = PHASE_GAIN * rg * bg;
+            // Rotazione della banda nel piano trasversale prima della camera.
+            let (sx, sy) = (side * amp2d, mid * amp2d);
+            let p = rot_yx([sx * rc - sy * rs, sx * rs + sy * rc, z], yaw, pitch);
+            let s = PHASE_FOCAL / (dist + p[2]).max(0.4);
+            poly.push((p[0] * s, p[1] * s));
+
+            let amp = (mid.abs() + side.abs()).clamp(0.0, 1.0);
+            let fade = (1.0 - age / n as f32).powf(1.2) * (s / s0).clamp(0.0, 1.4);
+            let k_bright = fade * (0.20 + amp * 0.95);
+            cols.push((c.r * k_bright, c.g * k_bright, c.b * k_bright));
+            widths.push(PHASE_LINE_W * (s / s0));
+        }
+        push_glow_ribbon(&mut out, &poly, &cols, &widths, false, inv_aspect);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Effetto nebulosa (campo di particelle su gusci sferici concentrici)
+// ---------------------------------------------------------------------------
+
+/// Numero di gusci sferici: uno ogni due-tre bande, campionate dallo spettro.
+const NEB_SHELLS: usize = 26;
+/// Particelle per guscio.
+const NEB_PER_SHELL: usize = 120;
+/// Raggio del guscio più interno (i bassi) e più esterno (gli acuti). Lasciano
+/// margine sopra la superficie per la spinta d'energia e l'onda d'urto: a
+/// pieno volume `NEB_R_MAX + NEB_PULSE + NEB_SHOCK_AMP` resta dentro il riquadro.
+const NEB_R_MIN: f32 = 0.22;
+const NEB_R_MAX: f32 = 0.82;
+/// Spinta radiale massima che l'energia di banda dà alle sue particelle.
+const NEB_PULSE: f32 = 0.24;
+/// Lunghezza focale e distanza a riposo della camera (i bassi la accorciano).
+const NEB_FOCAL: f32 = 2.4;
+const NEB_DIST: f32 = 3.3;
+/// Velocità del fronte d'onda d'urto (in raggi normalizzati al secondo).
+const NEB_SHOCK_SPEED: f32 = 1.5;
+/// Ampiezza radiale e larghezza della cresta dell'onda d'urto.
+const NEB_SHOCK_AMP: f32 = 0.32;
+const NEB_SHOCK_WIDTH: f32 = 0.16;
+/// Sopra questo `punch` nasce una nuova onda d'urto.
+const NEB_SHOCK_TRIGGER: f32 = 0.35;
+
+/// Un'onda d'urto radiale: nasce al centro su un transiente e si propaga verso
+/// l'esterno. `front` è la posizione normalizzata (0 = centro, 1 = superficie).
+#[derive(Clone, Copy)]
+struct Shock {
+    front: f32,
+    amp: f32,
+}
+
+/// Geometria statica della nebulosa: direzioni fisse sulla sfera unitaria.
+///
+/// Le direzioni sono precalcolate una volta e mai rigenerate: se le particelle
+/// cambiassero posizione ogni frame il campo formicolerebbe invece di respirare.
+/// A muoversi è solo il raggio, pilotato dall'energia di banda e dalle onde.
+struct NebulaMesh {
+    dir: Vec<[f32; 3]>,
+    /// Guscio di appartenenza (0 = interno), per applicare l'onda d'urto.
+    shell: Vec<usize>,
+    /// Posizione nello spettro del guscio (0..1): interno = bassi.
+    t: Vec<f32>,
+    /// Canale della particella: come nel poliedro, l'emisfero x ≥ 0 è il destro.
+    right: Vec<bool>,
+}
+
+impl NebulaMesh {
+    fn new() -> Self {
+        // Angolo aureo: la spirale di Fibonacci distribuisce i punti sulla
+        // sfera in modo quasi uniforme senza addensarli ai poli.
+        let golden = std::f32::consts::PI * (3.0 - 5.0f32.sqrt());
+        let denom = (NEB_SHELLS as f32 - 1.0).max(1.0);
+        let mut dir = Vec::with_capacity(NEB_SHELLS * NEB_PER_SHELL);
+        let mut shell = Vec::with_capacity(NEB_SHELLS * NEB_PER_SHELL);
+        let mut t = Vec::with_capacity(NEB_SHELLS * NEB_PER_SHELL);
+        let mut right = Vec::with_capacity(NEB_SHELLS * NEB_PER_SHELL);
+
+        for s in 0..NEB_SHELLS {
+            // Sfasa ogni guscio, altrimenti le spirali si allineano e le
+            // particelle sembrano disposte su meridiani.
+            let phase = s as f32 * 0.61;
+            for i in 0..NEB_PER_SHELL {
+                let y = 1.0 - 2.0 * (i as f32 + 0.5) / NEB_PER_SHELL as f32;
+                let rad = (1.0 - y * y).max(0.0).sqrt();
+                let theta = i as f32 * golden + phase;
+                let (st, ct) = theta.sin_cos();
+                let d = [ct * rad, y, st * rad];
+                dir.push(d);
+                shell.push(s);
+                t.push(s as f32 / denom);
+                right.push(d[0] >= 0.0);
+            }
+        }
+        Self {
+            dir,
+            shell,
+            t,
+            right,
+        }
+    }
+}
+
+/// Costruisce i vertici delle particelle (POINTS) per lo shader glow.
+///
+/// L'ordine è irrilevante: il blending additivo è commutativo, quindi non
+/// serve né z-buffer né ordinamento in profondità come per i ribbon.
+fn build_nebula(
+    mesh: &NebulaMesh,
+    left: &SpectrumFrame,
+    right: &SpectrumFrame,
+    shocks: &[Shock],
+    yaw: f32,
+    pitch: f32,
+    dist: f32,
+    palette: &Palette,
+    inv_aspect: f32,
+) -> Vec<f32> {
+    // Energia e spinta d'onda sono per guscio: calcolarle una volta invece che
+    // per particella risparmia `NEB_PER_SHELL` valutazioni identiche.
+    let mut shell_e = [0.0f32; NEB_SHELLS];
+    let mut shell_shock = [0.0f32; NEB_SHELLS];
+    let denom = (NEB_SHELLS as f32 - 1.0).max(1.0);
+    for s in 0..NEB_SHELLS {
+        let ts = s as f32 / denom;
+        let el = sample_spectrum(left, ts);
+        let er = sample_spectrum(right, ts);
+        shell_e[s] = (el + er) * 0.5;
+        let mut bump = 0.0;
+        for sh in shocks {
+            let d = (ts - sh.front) / NEB_SHOCK_WIDTH;
+            bump += sh.amp * (-d * d).exp();
+        }
+        shell_shock[s] = bump;
+    }
+
+    let s0 = NEB_FOCAL / dist.max(0.5);
+    let mut v = Vec::with_capacity(mesh.dir.len() * VERT_FLOATS);
+    for i in 0..mesh.dir.len() {
+        let s = mesh.shell[i];
+        let e = if mesh.right[i] {
+            sample_spectrum(right, mesh.t[i])
+        } else {
+            sample_spectrum(left, mesh.t[i])
+        };
+        let r = NEB_R_MIN
+            + mesh.t[i] * (NEB_R_MAX - NEB_R_MIN)
+            + e * NEB_PULSE
+            + shell_shock[s] * NEB_SHOCK_AMP;
+        let d = mesh.dir[i];
+        let p = rot_yx([d[0] * r, d[1] * r, d[2] * r], yaw, pitch);
+        let persp = NEB_FOCAL / (dist + p[2]).max(0.5);
+        let (x, y) = (p[0] * persp, p[1] * persp);
+
+        // La profondità dà il bagliore: le particelle vicine brillano, quelle
+        // sul lato lontano si spengono, ed è questo a far leggere il volume
+        // come una sfera invece che come un disco piatto di punti.
+        let depth = (persp / s0).clamp(0.0, 1.6);
+        let c = mix(palette.color_a, palette.color_b, mesh.t[i]);
+        let a = (depth * depth * (0.12 + e * 0.9 + shell_shock[s] * 0.7)).clamp(0.0, 1.0);
+        v.extend_from_slice(&[x * inv_aspect, y, c.r, c.g, c.b, a]);
+    }
+    v
+}
+
+// ---------------------------------------------------------------------------
+// Effetto rilievo (spettrogramma 3D che scorre verso l'orizzonte)
+// ---------------------------------------------------------------------------
+
+/// Campioni per lato di una cresta (il layout è speculare come negli altri
+/// effetti: centro = basse, bordi = alte, metà sinistra = L).
+const TER_HALF: usize = 32;
+/// Campioni totali di una cresta.
+const TER_COLS: usize = TER_HALF * 2;
+/// Creste tenute in memoria: a `TER_EMIT_RATE` sono ~2.4 s di storia.
+const TER_ROWS: usize = 48;
+/// Frazione di cresta emessa a ogni frame: 1/3 = una nuova ogni 3 frame.
+///
+/// Costante di proposito, mai pilotata dall'audio: qui l'asse in profondità
+/// *è* il tempo, e accelerarlo sui bassi — come fa il tunnel — vorrebbe dire
+/// disegnare uno spettrogramma con l'asse dei tempi deformato.
+const TER_EMIT_RATE: f32 = 1.0 / 3.0;
+/// Passo in profondità tra due creste consecutive.
+const TER_SPACING: f32 = 0.135;
+/// Semilarghezza del terreno nel mondo.
+const TER_WIDTH: f32 = 1.0;
+/// Altezza di una cresta a spettro pieno.
+const TER_HEIGHT: f32 = 0.85;
+/// Lunghezza focale della proiezione.
+const TER_FOCAL: f32 = 1.5;
+/// Distanza a riposo tra camera e cresta più vicina (i bassi la accorciano).
+const TER_DIST: f32 = 1.15;
+/// Quota della camera sopra il piano di base.
+const TER_EYE: f32 = 0.62;
+/// Altezza sullo schermo del punto di fuga.
+const TER_HORIZON: f32 = 0.34;
+/// Semi-spessore delle creste alla distanza più vicina.
+const TER_LINE_W: f32 = 0.0075;
+/// Una linea longitudinale ogni quante colonne (danno la trama della superficie).
+const TER_RAIL_STEP: usize = 8;
+/// Passate del kernel binomiale sulla cresta appena nata.
+const TER_SMOOTH_PASSES: usize = 2;
+/// Quanto una cresta eredita dalla precedente. Ammorbidisce il rilievo anche in
+/// profondità: senza, ogni cresta è indipendente e la superficie increspa.
+const TER_TIME_SMOOTH: f32 = 0.25;
+
+/// Smussa una cresta con un kernel binomiale [1, 2, 1], ripetuto.
+///
+/// Le bande sono a gradini, e in 3D un gradino non si legge come dettaglio
+/// spettrale ma come spigolo del terreno. Ai bordi il kernel replica l'ultimo
+/// campione, così le estremità non si abbassano da sole.
+fn smooth_row(h: &mut [f32; TER_COLS]) {
+    for _ in 0..TER_SMOOTH_PASSES {
+        let src = *h;
+        for (i, v) in h.iter_mut().enumerate() {
+            let a = src[i.saturating_sub(1)];
+            let c = src[(i + 1).min(TER_COLS - 1)];
+            *v = (a + 2.0 * src[i] + c) * 0.25;
+        }
+    }
+}
+
+/// Una cresta del rilievo: lo spettro congelato nell'istante in cui è nata.
+#[derive(Clone)]
+struct TerrainRow {
+    h: [f32; TER_COLS],
+    /// Transiente al momento della nascita: resta impresso nella cresta e si
+    /// allontana con lei, così la dinamica del brano si legge in profondità.
+    punch: f32,
+}
+
+/// Canale e posizione nello spettro della colonna `i`.
+///
+/// Ritorna (canale destro?, posizione 0..1 nello spettro).
+fn terrain_column(i: usize) -> (bool, f32) {
+    let d = (TER_HALF - 1) as f32;
+    if i < TER_HALF {
+        (false, (TER_HALF - 1 - i) as f32 / d)
+    } else {
+        (true, (i - TER_HALF) as f32 / d)
+    }
+}
+
+/// Proietta un punto del mondo: `x` = larghezza, `y` = quota, `z` = profondità.
+///
+/// Il piano di base (`y = 0`) tende a [`TER_HORIZON`] quando `z → ∞`: è quello
+/// il punto di fuga, e non serve calcolarlo a parte.
+fn terrain_project(x: f32, y: f32, z: f32, dist: f32, cam_x: f32) -> (f32, f32, f32) {
+    let s = TER_FOCAL / (dist + z).max(0.35);
+    ((x - cam_x) * s, (y - TER_EYE) * s + TER_HORIZON, s)
+}
+
+/// Attenuazione con la distanza: le creste vecchie sfumano nella foschia.
+///
+/// Senza z-buffer il fondo e il primo piano si sommerebbero identici e la
+/// profondità sparirebbe; è questa nebbia a ordinare la scena.
+fn terrain_fog(s: f32, s0: f32) -> f32 {
+    let k = s / s0;
+    (k * k).clamp(0.0, 1.0)
+}
+
+/// Costruisce il rilievo: riempimento sotto le creste e wireframe (creste
+/// trasversali + binari longitudinali).
+///
+/// Le creste si disegnano dalla più lontana alla più vicina: senza z-buffer
+/// l'ordine di disegno è l'unica cosa che stabilisce cosa sta davanti.
+fn build_terrain(
+    rows: &std::collections::VecDeque<TerrainRow>,
+    phase: f32,
+    dist: f32,
+    cam_x: f32,
+    palette: &Palette,
+    inv_aspect: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let n = rows.len();
+    let s0 = TER_FOCAL / dist.max(0.35);
+
+    // Proietta una volta sola: creste, binari e riempimento leggono tutti da
+    // qui. `crest` è il profilo, `base` la sua proiezione sul piano.
+    let mut crest = Vec::with_capacity(n * TER_COLS);
+    let mut base = Vec::with_capacity(n * TER_COLS);
+    let mut fog = Vec::with_capacity(n);
+    let mut scale = Vec::with_capacity(n);
+    for (r, row) in rows.iter().enumerate() {
+        let z = (r as f32 + phase) * TER_SPACING;
+        for (i, &h) in row.h.iter().enumerate() {
+            let x = ((i as f32 / (TER_COLS - 1) as f32) * 2.0 - 1.0) * TER_WIDTH;
+            let (sx, sy, s) = terrain_project(x, h * TER_HEIGHT, z, dist, cam_x);
+            crest.push((sx, sy));
+            let (bx, by, _) = terrain_project(x, 0.0, z, dist, cam_x);
+            base.push((bx, by));
+            if i == 0 {
+                fog.push(terrain_fog(s, s0));
+                scale.push(s / s0);
+            }
+        }
+    }
+
+    let col_tint: Vec<f32> = (0..TER_COLS).map(|i| terrain_column(i).1).collect();
+    let mut ribbons = Vec::new();
+    let mut fill: Vec<f32> = Vec::with_capacity(n * TER_COLS * 2 * VERT_FLOATS);
+    let mut pts = Vec::with_capacity(TER_COLS);
+    let mut cols = Vec::with_capacity(TER_COLS);
+    let mut widths = Vec::with_capacity(TER_COLS);
+
+    for r in (0..n).rev() {
+        let row = &rows[r];
+        let (f, sc) = (fog[r], scale[r]);
+        let off = r * TER_COLS;
+        pts.clear();
+        cols.clear();
+        widths.clear();
+        let mut strip: Vec<f32> = Vec::with_capacity(TER_COLS * 2 * VERT_FLOATS);
+
+        for i in 0..TER_COLS {
+            let h = row.h[i];
+            let c = mix(palette.color_a, palette.color_b, col_tint[i]);
+            let k = f * (0.16 + h * 0.85 + row.punch * 0.55);
+            pts.push(crest[off + i]);
+            cols.push((c.r * k, c.g * k, c.b * k));
+            widths.push(TER_LINE_W * sc);
+
+            // Velo sotto la cresta: dà corpo alla superficie senza nascondere
+            // il wireframe, che è quello che si legge davvero.
+            let a = f * (0.02 + h * 0.10);
+            let (cx, cy) = crest[off + i];
+            let (bx, by) = base[off + i];
+            strip.extend_from_slice(&[cx * inv_aspect, cy, c.r * a, c.g * a, c.b * a, 1.0]);
+            strip.extend_from_slice(&[bx * inv_aspect, by, 0.0, 0.0, 0.0, 1.0]);
+        }
+
+        push_glow_ribbon(&mut ribbons, &pts, &cols, &widths, false, inv_aspect);
+        if !fill.is_empty() {
+            let last: Vec<f32> = fill[fill.len() - VERT_FLOATS..].to_vec();
+            fill.extend_from_slice(&last);
+            fill.extend_from_slice(&strip[..VERT_FLOATS]);
+        }
+        fill.extend_from_slice(&strip);
+    }
+
+    // --- Binari longitudinali: legano tra loro le creste e rendono evidente
+    // la fuga prospettica. Tenui, sono struttura e non dato.
+    if n >= 3 {
+        let mut i = 0;
+        while i < TER_COLS {
+            pts.clear();
+            cols.clear();
+            widths.clear();
+            let c = mix(palette.color_a, palette.color_b, col_tint[i]);
+            for r in 0..n {
+                pts.push(crest[r * TER_COLS + i]);
+                let k = fog[r] * (0.05 + rows[r].h[i] * 0.22);
+                cols.push((c.r * k, c.g * k, c.b * k));
+                widths.push(TER_LINE_W * 0.6 * scale[r]);
+            }
+            push_glow_ribbon(&mut ribbons, &pts, &cols, &widths, false, inv_aspect);
+            i += TER_RAIL_STEP;
+        }
+    }
+
+    (fill, ribbons)
 }
 
 /// Vertici delle particelle (POINTS), dissolvenza tramite l'alpha (= life).

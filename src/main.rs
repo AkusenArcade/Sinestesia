@@ -65,7 +65,7 @@ enum Msg {
 }
 
 /// Etichette del dropdown effetti (l'ordine definisce gli indici).
-const EFFECT_LABELS: [&str; 8] = [
+const EFFECT_LABELS: [&str; 11] = [
     "Barre",
     "Linea",
     "Radiale",
@@ -74,6 +74,9 @@ const EFFECT_LABELS: [&str; 8] = [
     "Tunnel",
     "Poliedro",
     "Imaging",
+    "Rilievo",
+    "Fase",
+    "Nebulosa",
 ];
 
 /// Mappa l'effetto all'indice del dropdown.
@@ -87,6 +90,9 @@ fn effect_index(e: Effect) -> u32 {
         Effect::Tunnel => 5,
         Effect::Solid => 6,
         Effect::Imaging => 7,
+        Effect::Terrain => 8,
+        Effect::Phase => 9,
+        Effect::Nebula => 10,
     }
 }
 
@@ -100,6 +106,9 @@ fn index_effect(i: u32) -> Effect {
         5 => Effect::Tunnel,
         6 => Effect::Solid,
         7 => Effect::Imaging,
+        8 => Effect::Terrain,
+        9 => Effect::Phase,
+        10 => Effect::Nebula,
         _ => Effect::Bars,
     }
 }
@@ -293,15 +302,15 @@ impl SimpleComponent for App {
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
         // Stato condiviso col renderer, inizializzato dalle impostazioni.
+        // I buffer di analisi partono dai default: elencarli qui vorrebbe dire
+        // aggiornare due punti a ogni nuovo effetto che ne aggiunge uno.
         let viz = Rc::new(RefCell::new(VizState {
-            spectrum_left: [0.0; dsp::NUM_BANDS],
-            spectrum_right: [0.0; dsp::NUM_BANDS],
-            imaging: dsp::ImagingFrame::default(),
             palette: palette_for(&settings),
             gain: settings.gain,
             effect: settings.effect,
             mirror: settings.source == AudioSource::Input,
             blur: settings.blur,
+            ..VizState::default()
         }));
 
         // Avvia la cattura audio.

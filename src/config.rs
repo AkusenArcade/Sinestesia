@@ -39,9 +39,18 @@ pub enum Effect {
     /// Poliedro: solido geodetico 3D con spigoli luminosi, deformato dallo
     /// spettro e con le facce che si estrudono sui transienti.
     Solid,
-    /// Imaging: disco visto dall'alto a 30° con la direzione percepita del
-    /// suono (pan + coerenza di fase) sul perimetro.
+    /// Imaging: semicerchio frontale con la direzione percepita del suono
+    /// (pan + coerenza di fase) sull'arco, un lobo per fascia di frequenza.
     Imaging,
+    /// Rilievo: spettrogramma 3D: ogni frame nasce una cresta in primo piano e
+    /// le vecchie scorrono verso l'orizzonte sfumando nella foschia.
+    Terrain,
+    /// Fase: vettorscopio esteso nel tempo — la traiettoria mid/side della
+    /// forma d'onda si avvita in profondità mentre la camera oscilla.
+    Phase,
+    /// Nebulosa: campo di particelle su gusci sferici concentrici (bassi al
+    /// centro, acuti in superficie); i transienti lanciano onde d'urto radiali.
+    Nebula,
 }
 
 impl Default for Effect {

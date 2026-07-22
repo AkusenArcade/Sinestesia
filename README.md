@@ -34,12 +34,40 @@ I cinque effetti, ciascuno con un tema (colori automatici) e uno sfondo diversi:
   - *Poliedro* (solido geodetico 3D con spigoli luminosi: la latitudine dà la
     frequenza e l'emisfero il canale, i bassi lo avvicinano alla camera e i
     transienti fanno esplodere le facce verso l'esterno)
-  - *Imaging* (immagine stereo: disco visto dall'alto a 30°, ogni banda
-    posizionata nella direzione da cui è percepita. L'azimut viene da ITD e
-    ILD secondo la teoria duplex; su audio binaurale vero il fronte/retro è
-    dedotto dall'ombra del padiglione (crollo dell'ILD a 4–6 kHz). Su
-    materiale con semplice panning di ampiezza l'informazione fronte/retro
-    non esiste e l'effetto resta sull'arco frontale invece di inventarla)
+  - *Nebulosa* (campo di migliaia di particelle su gusci sferici concentrici,
+    uno per fascia di frequenza: i bassi al centro, gli acuti in superficie. Le
+    direzioni sono fisse (spirale di Fibonacci) e a muoversi è solo il raggio,
+    spinto dall'energia di banda, così il campo respira invece di formicolare.
+    I transienti lanciano onde d'urto radiali che si propagano dal centro verso
+    l'esterno; ruota su due assi con parallasse vera e il bagliore cala con la
+    profondità, che è ciò che fa leggere il volume come sfera e non come disco)
+  - *Rilievo* (spettrogramma 3D: ogni frame nasce una cresta in primo piano con
+    la sagoma dello spettro e le vecchie scorrono verso l'orizzonte sfumando
+    nella foschia, così restano visibili ~2,5 s di storia — il picco di due
+    secondi fa è ancora lì, come montagna in fondo. L'asse in profondità è il
+    tempo e scorre a passo fisso: accelerarlo sui bassi vorrebbe dire deformare
+    l'asse dei tempi. I bassi avvicinano la camera, i transienti restano
+    impressi nella cresta che nasce in quel momento e si allontanano con lei)
+  - *Fase* (vettorscopio esteso nel tempo: X = side, Y = mid, Z = tempo. La
+    traiettoria mid/side della forma d'onda — l'unico effetto che disegna il
+    segnale invece dello spettro — diventa un nastro che si avvita in
+    profondità mentre la camera oscilla su due assi. Un crossover a due tagli
+    (250 Hz, 2,5 kHz) la separa in tre nastri concentrici: i bassi stretti
+    attorno all'asse, medi e alti via via più larghi e mossi, così la parte
+    stereo risalta invece di sparire in un unico filo. Mono = fili verticali,
+    stereo largo = spirali che si aprono, controfase = nastro rovesciato sulla
+    diagonale. I bassi avvicinano la camera)
+  - *Imaging* (immagine stereo frontale: semicerchio con l'ascoltatore al
+    centro della corda, ogni banda posizionata nella direzione da cui è
+    percepita, e tre lobi separati per bassi / medi / alti — sotto i 250 Hz la
+    localizzazione è debole e il mix tiene quasi sempre i bassi al centro,
+    quindi un lobo unico li lasciava coprire proprio la parte direzionale. L'azimut combina differenza di tempo e di ampiezza secondo la
+    teoria duplex e passa per la legge della tangente; l'arco disegnato *è* il
+    palco stereo, quindi i suoi estremi sono i due diffusori (±30° reali) e un
+    pan tutto a destra finisce sul bordo destro. Niente metà posteriore:
+    da due canali il fronte/retro non è ricostruibile, e l'energia decorrelata
+    — riverbero, ambienza — non ha direzione, quindi allarga il lobo invece di
+    spostarsi da un lato)
 - **Layout speculare stereo**: centro = basse frequenze, bordi/lati = alte;
   metà sinistra = canale L, metà destra = canale R (in input: mirror mono).
 - **Colori**: manuali (due color picker) o **automatici** dal tema di sistema

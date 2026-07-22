@@ -21,6 +21,12 @@ const DECAY: f32 = 0.18;
 /// Uno snapshot dello spettro: `NUM_BANDS` valori normalizzati 0.0–1.0.
 pub type SpectrumFrame = [f32; NUM_BANDS];
 
+/// Frequenza centrale della banda `b`, in Hz. Inverte il binning logaritmico.
+pub fn band_center_hz(b: usize) -> f32 {
+    let t = (b as f32 + 0.5) / NUM_BANDS as f32;
+    FREQ_MIN * (FREQ_MAX / FREQ_MIN).powf(t)
+}
+
 /// Analizzatore di spettro riutilizzabile (alloca i buffer una sola volta).
 pub struct Analyzer {
     fft: Arc<dyn Fft<f32>>,
@@ -117,32 +123,33 @@ impl Default for Analyzer {
     }
 }
 
-/// Massima differenza di tempo interaurale (testa umana): ±0.66 ms.
-const ITD_MAX: f32 = 0.00066;
-/// Differenza di livello interaurale che corrisponde a una sorgente laterale.
-const ILD_FULL_DB: f32 = 18.0;
+/// Differenza di tempo che porta l'immagine al bordo del palco frontale.
+///
+/// Nella stereofonia a due canali una differenza di ~0.6 ms tra i due segnali
+/// basta a spostare l'immagine fino al diffusore (legge del ritardo, Haas):
+/// oltre non si va, l'immagine si limita a restare al bordo.
+const ITD_FULL: f32 = 0.0006;
 /// Estremi del crossover della teoria duplex: sotto domina l'ITD, sopra l'ILD.
 const DUPLEX_LO_HZ: f32 = 700.0;
 const DUPLEX_HI_HZ: f32 = 1600.0;
+/// Semiapertura del palco stereo: i due diffusori del triangolo standard
+/// stanno a ±30° dalla direzione di ascolto (ITU-R BS.775).
+pub const STAGE_HALF_ANGLE: f32 = std::f32::consts::PI / 6.0;
 
-/// Snapshot dell'immagine stereo: per ogni banda, da dove arriva il suono e
-/// quanto è localizzato.
+/// Snapshot dell'immagine stereo **frontale**: per ogni banda, da dove arriva
+/// il suono dentro il palco e quanto è localizzato.
 #[derive(Debug, Clone, Copy)]
 pub struct ImagingFrame {
-    /// Azimut della componente direzionale, radianti: 0 = fronte, +π/2 = destra.
+    /// Azimut della componente direzionale, radianti: 0 = fronte,
+    /// ±[`STAGE_HALF_ANGLE`] = diffusore destro / sinistro.
     ///
-    /// Sempre sull'**arco frontale**: da due soli canali il fronte/retro non è
-    /// recuperabile. Una sorgente a 45° davanti-destra e una a 135°
-    /// dietro-destra hanno ITD e ILD identici (cono di confusione), e a
-    /// distinguerle sono solo i cue spettrali del padiglione, che dipendono
-    /// dall'HRTF usato in registrazione.
+    /// Solo **arco frontale**, ed entro il palco: da due canali il fronte/retro
+    /// non è recuperabile (cono di confusione) e una sorgente panpottata non
+    /// esiste fuori dalla base dei diffusori. Disegnare oltre sarebbe inventare.
     pub azimuth: [f32; NUM_BANDS],
     /// Diffusività: 0 = sorgente localizzata, 1 = campo decorrelato (ambienza,
     /// riverbero). È l'energia che non ha una direzione, non "il suono dietro".
     pub diffuseness: [f32; NUM_BANDS],
-    /// Stima fronte/retro dell'intera scena: 0 = davanti o indecidibile,
-    /// 1 = dietro. Vedi [`ImagingAnalyzer::rear_estimate`].
-    pub rear: f32,
     /// Energia della banda (0..1), stessa mappatura dB degli spettri.
     pub energy: [f32; NUM_BANDS],
 }
@@ -153,20 +160,9 @@ impl Default for ImagingFrame {
             azimuth: [0.0; NUM_BANDS],
             diffuseness: [0.0; NUM_BANDS],
             energy: [0.0; NUM_BANDS],
-            rear: 0.0,
         }
     }
 }
-
-/// Bande usate per il discriminante fronte/retro: l'ombra del padiglione si
-/// manifesta come un crollo dell'ILD tra 4 e 6 kHz rispetto alla regione
-/// 2–3 kHz, presa come riferimento.
-const PINNA_BAND_HZ: (f32, f32) = (3800.0, 6500.0);
-const REF_BAND_HZ: (f32, f32) = (1800.0, 3200.0);
-/// Valore del discriminante che corrisponde a "sicuramente dietro", in dB.
-const REAR_FULL_DB: f32 = 4.0;
-/// ILD totale oltre la quale la scena è abbastanza laterale da poter decidere.
-const REAR_LATERAL_DB: f32 = 6.0;
 
 /// Peso dell'ITD nel crossover duplex: pieno alle basse, nullo alle alte.
 ///
@@ -227,64 +223,6 @@ impl ImagingAnalyzer {
         }
     }
 
-    /// ILD (dB) integrata su un intervallo di frequenze.
-    fn ild_db(&self, lo_hz: f32, hi_hz: f32) -> f32 {
-        let bin_hz = SAMPLE_RATE as f32 / FFT_SIZE as f32;
-        let lo = ((lo_hz / bin_hz) as usize).max(1);
-        let hi = ((hi_hz / bin_hz) as usize).min(FFT_SIZE / 2 - 1);
-        let (mut sl, mut sr) = (0.0f32, 0.0f32);
-        for k in lo..=hi {
-            sl += self.buf_l[k].norm_sqr();
-            sr += self.buf_r[k].norm_sqr();
-        }
-        10.0 * ((sr + 1e-12) / (sl + 1e-12)).log10()
-    }
-
-    /// Stima fronte/retro: 0 = davanti o indecidibile, 1 = dietro.
-    ///
-    /// Il padiglione è rivolto in avanti, quindi fa ombra alle sorgenti
-    /// posteriori: una sorgente laterale davanti produce un ILD forte a
-    /// 4–6 kHz, la stessa posizione dietro no. Il discriminante è la
-    /// differenza di ILD tra quella regione e i 2–3 kHz di riferimento.
-    ///
-    /// Essendo un **rapporto** R/L, lo spettro della sorgente si cancella: il
-    /// risultato non dipende dal materiale. Verificato su HRTF MIT KEMAR con
-    /// rumore rosa e con voce, agli azimut 30/45/60 contro 120/135/150.
-    ///
-    /// Due limiti, entrambi gestiti restituendo 0 invece di inventare:
-    /// sul **piano mediano** (0° e 180°) le due orecchie sono equidistanti e
-    /// l'ILD è identica per costruzione — nessun algoritmo può decidere; e su
-    /// materiale con **panning di ampiezza** l'ILD è piatta in frequenza,
-    /// quindi il discriminante vale ~0. Serve audio binaurale vero.
-    fn rear_estimate(&self) -> f32 {
-        let d = self.ild_db(PINNA_BAND_HZ.0, PINNA_BAND_HZ.1)
-            - self.ild_db(REF_BAND_HZ.0, REF_BAND_HZ.1);
-        let lateral = (self.ild_db(200.0, 16000.0).abs() / REAR_LATERAL_DB).clamp(0.0, 1.0);
-        (-d / REAR_FULL_DB).clamp(0.0, 1.0) * lateral * self.plausibility()
-    }
-
-    /// Quanto il segnale somiglia a qualcosa di acusticamente reale.
-    ///
-    /// Sotto 1 kHz la lunghezza d'onda è molto maggiore della testa, quindi le
-    /// due orecchie ricevono quasi la stessa forma d'onda e la coerenza è alta.
-    /// Uno stereo widener, che decorrela o inverte la fase, la fa crollare: in
-    /// quel caso l'ILD alle alte è un artefatto del processing e leggerla come
-    /// ombra del padiglione darebbe un falso "dietro".
-    fn plausibility(&self) -> f32 {
-        let bin_hz = SAMPLE_RATE as f32 / FFT_SIZE as f32;
-        let lo = ((200.0 / bin_hz) as usize).max(1);
-        let hi = ((1000.0 / bin_hz) as usize).min(FFT_SIZE / 2 - 1);
-        let (mut sll, mut srr) = (0.0f32, 0.0f32);
-        let mut slr = Complex::new(0.0f32, 0.0f32);
-        for k in lo..=hi {
-            sll += self.buf_l[k].norm_sqr();
-            srr += self.buf_r[k].norm_sqr();
-            slr += self.buf_l[k] * self.buf_r[k].conj();
-        }
-        let coh = slr.norm() / (sll * srr).sqrt().max(1e-12);
-        ((coh - 0.55) / 0.25).clamp(0.0, 1.0)
-    }
-
     /// Calcola pan, coerenza ed energia per banda dal cross-spettro L/R.
     pub fn analyze(&mut self, audio: &AudioBuffer, gain: f32) -> ImagingFrame {
         audio.snapshot(Channel::Left, &mut self.samples);
@@ -297,9 +235,6 @@ impl ImagingAnalyzer {
         }
         self.fft.process(&mut self.buf_l);
         self.fft.process(&mut self.buf_r);
-
-        let rear = self.rear_estimate();
-        self.smoothed.rear += (rear - self.smoothed.rear) * 0.12;
 
         for b in 0..NUM_BANDS {
             let lo = self.band_edges[b];
@@ -326,20 +261,22 @@ impl ImagingAnalyzer {
             // segno da una banda all'altra e sballottava l'immagine.
             let coh = (slr.norm() / (sll * srr).sqrt().max(1e-12)).clamp(0.0, 1.0);
 
-            // ILD: ombra della testa, dominante sopra ~1.5 kHz.
-            let ild_db = 10.0 * ((srr + 1e-12) / (sll + 1e-12)).log10();
-            let lat_ild = (ild_db / ILD_FULL_DB).clamp(-1.0, 1.0);
+            // Differenza di ampiezza, normalizzata: -1 = tutto a sinistra,
+            // 0 = centro, +1 = tutto a destra. È esattamente il rapporto dei
+            // guadagni di un pan-pot, quindi non serve alcuna scala in dB.
+            let (al, ar) = (sll.sqrt(), srr.sqrt());
+            let pan_ild = (ar - al) / (ar + al + 1e-12);
 
             // ITD: la fase del cross-spettro è ωτ. Fase positiva = R ritardato
             // = sorgente a sinistra, da cui il segno meno.
             let freq = self.band_freqs[b].max(1.0);
             let tau = slr.arg() / (std::f32::consts::TAU * freq);
-            let lat_itd =
-                -(tau / ITD_MAX).clamp(-1.0, 1.0) * duplex_itd_weight(freq) * coh;
+            let pan_itd = -(tau / ITD_FULL).clamp(-1.0, 1.0) * duplex_itd_weight(freq) * coh;
 
             // I due cue si sommano (time-intensity trading): un pan-pot dà solo
-            // ILD, un binaurale alle basse solo ITD, e materiale reale entrambi.
-            let lat = (lat_itd + lat_ild).clamp(-1.0, 1.0);
+            // ampiezza, una coppia di microfoni distanziati solo tempo, e le
+            // tecniche intermedie entrambi.
+            let pan = (pan_itd + pan_ild).clamp(-1.0, 1.0);
 
             let mag = peak / (FFT_SIZE as f32 * 0.5);
             let db = 20.0 * (mag + 1e-9).log10();
@@ -355,9 +292,22 @@ impl ImagingAnalyzer {
             // Le bande deboli hanno direzione dominata dal rumore: le si fa
             // muovere lentamente, così l'immagine non sfarfalla nei silenzi.
             let k = 0.10 + 0.30 * self.smoothed.energy[b];
-            let azimuth = lat.asin();
+
+            // Legge della tangente: tan(θ) / tan(θ₀) = pan, con θ₀ semiapertura
+            // del palco. È la relazione che lega i guadagni dei due diffusori
+            // alla direzione effettivamente percepita al punto di ascolto, ed è
+            // il motivo per cui un pan a metà strada *non* si sente a 15°.
+            let azimuth = (pan * STAGE_HALF_ANGLE.tan()).atan();
             self.smoothed.azimuth[b] += (azimuth - self.smoothed.azimuth[b]) * k;
-            self.smoothed.diffuseness[b] += ((1.0 - coh) - self.smoothed.diffuseness[b]) * k;
+
+            // La coerenza misura la diffusività solo se **entrambi** i canali
+            // portano segnale: con un pan estremo `sll → 0`, il rapporto è fatto
+            // di rumore e crolla — ma quello è il caso più localizzato che
+            // esista, non un campo diffuso. Quindi la si spegne man mano che
+            // l'immagine si sbilancia, altrimenti un suono tutto a destra viene
+            // letto come ambienza e spalmato su tutto l'arco.
+            let diffuse = (1.0 - coh) * (1.0 - pan.abs());
+            self.smoothed.diffuseness[b] += (diffuse - self.smoothed.diffuseness[b]) * k;
         }
 
         self.smoothed
