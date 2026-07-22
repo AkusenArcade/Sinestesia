@@ -13,3 +13,6 @@ packaging/aur/src/
 packaging/aur/pkg/
 packaging/aur/*.tar.gz
 packaging/aur/*.pkg.tar.*
+
+# File audio di test binaurale (non versionati: ~2 MB di wav)
+sinestesia-testdata/
