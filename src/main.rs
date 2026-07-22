@@ -36,6 +36,12 @@ struct App {
     audio: Option<AudioHandle>,
     /// Watcher del file tema matugen (noctalia.css), per il live reload colori.
     _theme_watcher: Option<notify::RecommendedWatcher>,
+    /// Modalità "solo visualizzatore": header bar e pannello controlli
+    /// nascosti. Volutamente NON persistita: si rientra sempre in finestra
+    /// normale, altrimenti al riavvio ci si ritroverebbe senza controlli e
+    /// senza sapere come farli riapparire.
+    chrome_hidden: bool,
+    fullscreen: bool,
 }
 
 /// Messaggi dell'applicazione.
@@ -50,10 +56,25 @@ enum Msg {
     SetBlur(f64),
     /// Il file colori noctalia è cambiato: ricarica la palette (se Auto).
     ReloadAutoTheme,
+    /// Mostra/nasconde header bar e pannello controlli (H).
+    ToggleChrome,
+    /// Entra/esce da schermo intero, nascondendo anche le barre (F11).
+    ToggleFullscreen,
+    /// Esce dalla modalità immersiva e ripristina le barre (Esc).
+    ExitImmersive,
 }
 
 /// Etichette del dropdown effetti (l'ordine definisce gli indici).
-const EFFECT_LABELS: [&str; 5] = ["Barre", "Linea", "Radiale", "Linea Spettro", "Radiale Spettro"];
+const EFFECT_LABELS: [&str; 8] = [
+    "Barre",
+    "Linea",
+    "Radiale",
+    "Linea Spettro",
+    "Radiale Spettro",
+    "Tunnel",
+    "Poliedro",
+    "Imaging",
+];
 
 /// Mappa l'effetto all'indice del dropdown.
 fn effect_index(e: Effect) -> u32 {
@@ -63,6 +84,9 @@ fn effect_index(e: Effect) -> u32 {
         Effect::Radial => 2,
         Effect::LineSpectrum => 3,
         Effect::RadialSpectrum => 4,
+        Effect::Tunnel => 5,
+        Effect::Solid => 6,
+        Effect::Imaging => 7,
     }
 }
 
@@ -73,6 +97,9 @@ fn index_effect(i: u32) -> Effect {
         2 => Effect::Radial,
         3 => Effect::LineSpectrum,
         4 => Effect::RadialSpectrum,
+        5 => Effect::Tunnel,
+        6 => Effect::Solid,
+        7 => Effect::Imaging,
         _ => Effect::Bars,
     }
 }
@@ -113,15 +140,28 @@ impl SimpleComponent for App {
         adw::ApplicationWindow {
             set_title: Some("Sinestesia"),
             set_default_size: (1100, 640),
+            #[watch]
+            set_fullscreened: model.fullscreen,
 
             gtk::Box {
                 set_orientation: gtk::Orientation::Vertical,
 
                 adw::HeaderBar {
+                    #[watch]
+                    set_visible: !model.chrome_hidden,
                     #[wrap(Some)]
                     set_title_widget = &adw::WindowTitle {
                         set_title: "Sinestesia",
                         set_subtitle: "Visualizzatore audio",
+                    },
+                    pack_end = &gtk::Button {
+                        set_icon_name: "view-fullscreen-symbolic",
+                        set_tooltip_text: Some(
+                            "Solo visualizzatore (F11) · H nasconde le barre · Esc esce",
+                        ),
+                        connect_clicked[sender] => move |_| {
+                            sender.input(Msg::ToggleFullscreen);
+                        },
                     },
                 },
 
@@ -135,6 +175,8 @@ impl SimpleComponent for App {
 
                 // Pannello controlli.
                 gtk::Box {
+                    #[watch]
+                    set_visible: !model.chrome_hidden,
                     set_orientation: gtk::Orientation::Horizontal,
                     set_spacing: 10,
                     set_margin_all: 12,
@@ -254,6 +296,7 @@ impl SimpleComponent for App {
         let viz = Rc::new(RefCell::new(VizState {
             spectrum_left: [0.0; dsp::NUM_BANDS],
             spectrum_right: [0.0; dsp::NUM_BANDS],
+            imaging: dsp::ImagingFrame::default(),
             palette: palette_for(&settings),
             gain: settings.gain,
             effect: settings.effect,
@@ -280,6 +323,8 @@ impl SimpleComponent for App {
             buffer: buffer.clone(),
             audio,
             _theme_watcher: theme_watcher,
+            chrome_hidden: false,
+            fullscreen: false,
         };
 
         // Anche un eventuale cambio dell'accent color di sistema aggiorna i colori.
@@ -289,6 +334,26 @@ impl SimpleComponent for App {
         });
 
         let widgets = view_output!();
+
+        // Scorciatoie della modalità immersiva. Fase di cattura: altrimenti
+        // il widget che ha il focus (dropdown, slider) si mangia il tasto
+        // prima che arrivi alla finestra.
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        keys.connect_key_pressed({
+            let sender = sender.clone();
+            move |_, key, _, _| {
+                let msg = match key {
+                    gtk::gdk::Key::F11 => Msg::ToggleFullscreen,
+                    gtk::gdk::Key::h | gtk::gdk::Key::H => Msg::ToggleChrome,
+                    gtk::gdk::Key::Escape => Msg::ExitImmersive,
+                    _ => return gtk::glib::Propagation::Proceed,
+                };
+                sender.input(msg);
+                gtk::glib::Propagation::Stop
+            }
+        });
+        root.add_controller(keys);
 
         // Inserisce la GLArea nell'area nera del visualizzatore.
         let gl_area = render::build_gl_area(buffer, viz);
@@ -345,6 +410,22 @@ impl SimpleComponent for App {
                     log::info!("colori tema (matugen) aggiornati");
                 }
                 return; // nessuna impostazione da salvare
+            }
+            Msg::ToggleChrome => {
+                self.chrome_hidden = !self.chrome_hidden;
+                return;
+            }
+            Msg::ToggleFullscreen => {
+                self.fullscreen = !self.fullscreen;
+                // Lo schermo intero implica la modalità immersiva; uscendo si
+                // ripristinano le barre.
+                self.chrome_hidden = self.fullscreen;
+                return;
+            }
+            Msg::ExitImmersive => {
+                self.fullscreen = false;
+                self.chrome_hidden = false;
+                return;
             }
         }
         if let Err(e) = self.settings.save() {

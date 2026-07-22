@@ -33,6 +33,15 @@ pub enum Effect {
     LineSpectrum,
     /// Variante "neon" del radiale: curva continua trasparente + bordo luminoso.
     RadialSpectrum,
+    /// Tunnel: anelli che congelano la sagoma dello spettro e si espandono
+    /// verso l'osservatore, con vortice e campo di stelle.
+    Tunnel,
+    /// Poliedro: solido geodetico 3D con spigoli luminosi, deformato dallo
+    /// spettro e con le facce che si estrudono sui transienti.
+    Solid,
+    /// Imaging: disco visto dall'alto a 30° con la direzione percepita del
+    /// suono (pan + coerenza di fase) sul perimetro.
+    Imaging,
 }
 
 impl Default for Effect {
