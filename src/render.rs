@@ -20,9 +20,10 @@ use glow::HasContext;
 use gtk::glib;
 use gtk::prelude::*;
 use relm4::gtk;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Palette colori del visualizzatore (gradiente A→B).
 #[derive(Debug, Clone, Copy)]
@@ -61,6 +62,10 @@ pub struct VizState {
     pub mirror: bool,
     /// Intensità del motion blur (0.0 = nessuno, →1.0 = scie lunghe).
     pub blur: f32,
+    /// Passi di simulazione a 60 Hz maturati e non ancora consumati da un
+    /// render. Vale 1 nel caso normale; sale quando il render è più lento del
+    /// tick, e `draw` li recupera avanzando l'animazione più volte.
+    pub steps: u32,
 }
 
 impl Default for VizState {
@@ -75,9 +80,22 @@ impl Default for VizState {
             effect: Effect::Bars,
             mirror: false,
             blur: 0.0,
+            steps: 0,
         }
     }
 }
+
+/// Periodo nominale di un passo di simulazione (60 Hz).
+const STEP_PERIOD: Duration = Duration::from_micros(16_667);
+
+/// Silenzio del frame clock oltre il quale lo si considera fermo e il timer di
+/// riserva prende il suo posto. Un frame a 60 Hz dura 16.7 ms: 40 ms lascia
+/// spazio a un frame saltato senza far intervenire la riserva per niente.
+const CLOCK_DEAD: Duration = Duration::from_millis(40);
+
+/// Tetto ai passi recuperati in un solo render. Senza, dopo una finestra
+/// rimasta a lungo invisibile il primo frame visibile ne eseguirebbe migliaia.
+const MAX_CATCHUP_STEPS: u32 = 4;
 
 /// Carica i puntatori alle funzioni OpenGL tramite libepoxy.
 /// Da chiamare una sola volta all'avvio, prima di realizzare la `GLArea`.
@@ -132,6 +150,13 @@ pub fn build_gl_area(audio: Arc<AudioBuffer>, state: Rc<RefCell<VizState>>) -> g
         let state = state.clone();
         move |area, _ctx| {
             if let Some(r) = renderer.borrow_mut().as_mut() {
+                // Consuma i passi maturati dal tick: se il render è andato più
+                // lento di 60 Hz ne trova più di uno e l'animazione recupera,
+                // invece di rallentare insieme al frame rate.
+                let steps = {
+                    let mut st = state.borrow_mut();
+                    std::mem::replace(&mut st.steps, 0).clamp(1, MAX_CATCHUP_STEPS)
+                };
                 let st = state.borrow();
                 let (w, h) = (area.width().max(1), area.height().max(1));
                 r.draw(
@@ -144,21 +169,38 @@ pub fn build_gl_area(audio: Arc<AudioBuffer>, state: Rc<RefCell<VizState>>) -> g
                     w,
                     h,
                     st.blur,
+                    steps,
                 );
             }
             glib::Propagation::Stop
         }
     });
 
-    // Tick a ogni frame: analizza i due canali e richiede il redraw.
+    // Analisi audio e avanzamento dell'animazione a 60 Hz.
+    //
+    // La sorgente primaria è il tick del frame clock, agganciato al vsync. Ma
+    // quando la finestra non è in un'area visibile dello schermo (occlusa,
+    // minimizzata, su un altro workspace) il compositore smette di mandare i
+    // frame callback e il frame clock si ferma: il tick non arriva più e la
+    // visualizzazione scende ben sotto i 60 Hz. Un timer GLib di riserva —
+    // che il compositore non può fermare — subentra appena il clock tace, così
+    // DSP, smoothing e simulazione restano a 60 Hz comunque.
+    //
     // Due Analyzer distinti per mantenere smoothing indipendenti per canale.
     let analyzer_l = Rc::new(RefCell::new(Analyzer::new()));
     let analyzer_r = Rc::new(RefCell::new(Analyzer::new()));
     let analyzer_img = Rc::new(RefCell::new(ImagingAnalyzer::new()));
     let phase_filter = Rc::new(RefCell::new(PhaseFilter::new(crate::audio::SAMPLE_RATE)));
-    area.add_tick_callback({
+
+    // Istante dell'ultimo passo eseguito e "il frame clock sta battendo?".
+    let last_step = Rc::new(Cell::new(Instant::now()));
+    let clock_alive = Rc::new(Cell::new(false));
+
+    let step: Rc<dyn Fn()> = {
         let state = state.clone();
-        move |area, _clock| {
+        let last_step = last_step.clone();
+        Rc::new(move || {
+            last_step.set(Instant::now());
             let (gain, mirror, effect) = {
                 let s = state.borrow();
                 (s.gain, s.mirror, s.effect)
@@ -177,17 +219,44 @@ pub fn build_gl_area(audio: Arc<AudioBuffer>, state: Rc<RefCell<VizState>>) -> g
             // solo quando serve davvero.
             let phase = (effect == Effect::Phase)
                 .then(|| phase_filter.borrow_mut().sample(&audio, gain));
-            {
-                let mut s = state.borrow_mut();
-                s.spectrum_left = left;
-                s.spectrum_right = right;
-                if let Some(img) = imaging {
-                    s.imaging = img;
-                }
-                if let Some(seg) = phase {
-                    s.phase_seg = seg;
-                }
+            let mut s = state.borrow_mut();
+            s.spectrum_left = left;
+            s.spectrum_right = right;
+            if let Some(img) = imaging {
+                s.imaging = img;
             }
+            if let Some(seg) = phase {
+                s.phase_seg = seg;
+            }
+            s.steps = (s.steps + 1).min(MAX_CATCHUP_STEPS);
+        })
+    };
+
+    area.add_tick_callback({
+        let step = step.clone();
+        let clock_alive = clock_alive.clone();
+        move |area, _clock| {
+            clock_alive.set(true);
+            step();
+            area.queue_render();
+            glib::ControlFlow::Continue
+        }
+    });
+
+    // Riserva: batte a 60 Hz ma resta inerte finché il frame clock è vivo.
+    // Se per oltre `CLOCK_DEAD` non arriva un tick lo dichiara fermo e prende
+    // il posto, fino al tick successivo che glielo restituisce.
+    glib::timeout_add_local(STEP_PERIOD, {
+        let area = area.downgrade();
+        move || {
+            let Some(area) = area.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if clock_alive.get() && last_step.get().elapsed() < CLOCK_DEAD {
+                return glib::ControlFlow::Continue;
+            }
+            clock_alive.set(false);
+            step();
             area.queue_render();
             glib::ControlFlow::Continue
         }
@@ -478,6 +547,7 @@ impl Renderer {
         width: i32,
         height: i32,
         blur: f32,
+        steps: u32,
     ) {
         unsafe {
             self.gl.viewport(0, 0, width, height);
@@ -514,7 +584,9 @@ impl Renderer {
                 let spokes = build_radial_spokes(left, right, palette, inv_aspect);
                 self.draw_arrays(&spokes, glow::TRIANGLES, self.pos_loc, self.col_loc);
 
-                self.update_particles(left, right);
+                for _ in 0..steps {
+                    self.update_particles(left, right);
+                }
                 let pts = build_particle_vertices(&self.particles, palette, inv_aspect);
                 // Particelle: programma glow + blending additivo per il bagliore.
                 unsafe {
@@ -534,7 +606,9 @@ impl Renderer {
                 self.draw_neon(&fill, &glow_ribbon, &line);
 
                 // Particelle come nel radiale: emesse dalla curva in movimento.
-                self.update_particles(left, right);
+                for _ in 0..steps {
+                    self.update_particles(left, right);
+                }
                 let pts = build_particle_vertices(&self.particles, palette, inv_aspect);
                 unsafe {
                     self.gl.use_program(Some(self.glow_program));
@@ -544,7 +618,9 @@ impl Renderer {
             }
             Effect::Tunnel => {
                 let inv_aspect = height as f32 / width as f32;
-                self.update_tunnel(left, right);
+                for _ in 0..steps {
+                    self.update_tunnel(left, right);
+                }
 
                 // Stelle sotto gli anelli: entrambi additivi, l'ordine conta poco
                 // ma così i tubi di luce restano in primo piano.
@@ -569,6 +645,9 @@ impl Renderer {
             }
             Effect::Solid => {
                 let inv_aspect = height as f32 / width as f32;
+                for _ in 1..steps {
+                    self.update_solid(left, right);
+                }
                 let (yaw, pitch, dist) = self.update_solid(left, right);
                 let vs = project_solid(&self.solid, left, right, yaw, pitch, dist);
                 // Riferimento prospettico al centro: normalizza il fog a 1.
@@ -610,6 +689,9 @@ impl Renderer {
             }
             Effect::Nebula => {
                 let inv_aspect = height as f32 / width as f32;
+                for _ in 1..steps {
+                    self.update_nebula(left, right);
+                }
                 let (yaw, pitch, dist) = self.update_nebula(left, right);
                 let pts = build_nebula(
                     &self.nebula, left, right, &self.shocks, yaw, pitch, dist, palette,
@@ -623,6 +705,9 @@ impl Renderer {
             }
             Effect::Phase => {
                 let inv_aspect = height as f32 / width as f32;
+                for _ in 1..steps {
+                    self.update_phase(phase_seg, left, right);
+                }
                 let (yaw, pitch, dist) = self.update_phase(phase_seg, left, right);
                 let ribbon = build_phase(
                     &self.phase_pts,
@@ -646,6 +731,9 @@ impl Renderer {
             }
             Effect::Terrain => {
                 let inv_aspect = height as f32 / width as f32;
+                for _ in 1..steps {
+                    self.update_terrain(left, right);
+                }
                 let (dist, cam_x) = self.update_terrain(left, right);
                 let (fill, ribbons) = build_terrain(
                     &self.terrain,
