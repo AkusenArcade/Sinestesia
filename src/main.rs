@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 /// CSS applicato globalmente. L'area del visualizzatore resta nera
 /// indipendentemente dal tema della chrome (FR-8.5); il resto dell'UI
-/// eredita il tema di sistema (noctalia/matugen) via libadwaita (FR-8).
+/// eredita il tema di sistema (Bioma o noctalia, via matugen) via libadwaita (FR-8).
 const APP_CSS: &str = "
 .viz-area {
     background-color: #000000;
@@ -34,7 +34,7 @@ struct App {
     buffer: Arc<AudioBuffer>,
     /// Sessione di cattura attiva (None solo transitoriamente).
     audio: Option<AudioHandle>,
-    /// Watcher del file tema matugen (noctalia.css), per il live reload colori.
+    /// Watcher dei file tema matugen (bioma.css, noctalia.css), per il live reload colori.
     _theme_watcher: Option<notify::RecommendedWatcher>,
     /// Modalità "solo visualizzatore": header bar e pannello controlli
     /// nascosti. Volutamente NON persistita: si rientra sempre in finestra
@@ -54,7 +54,7 @@ enum Msg {
     SetColorB(Rgb),
     SetGain(f64),
     SetBlur(f64),
-    /// Il file colori noctalia è cambiato: ricarica la palette (se Auto).
+    /// Il file colori del tema è cambiato: ricarica la palette (se Auto).
     ReloadAutoTheme,
     /// Mostra/nasconde header bar e pannello controlli (H).
     ToggleChrome,
@@ -224,7 +224,7 @@ impl SimpleComponent for App {
                     gtk::Switch {
                         set_valign: gtk::Align::Center,
                         set_active: matches!(model.settings.color_mode, ColorMode::Auto),
-                        set_tooltip_text: Some("Acceso: colori dal tema di sistema (noctalia)"),
+                        set_tooltip_text: Some("Acceso: colori dal tema di sistema (Bioma o noctalia)"),
                         connect_active_notify[sender] => move |sw| {
                             let m = if sw.is_active() {
                                 ColorMode::Auto
@@ -317,7 +317,7 @@ impl SimpleComponent for App {
         let buffer = AudioBuffer::new(dsp::FFT_SIZE * 2);
         let audio = Some(audio::start(buffer.clone(), settings.source));
 
-        // Osserva il file tema matugen (noctalia.css): in Auto la palette si
+        // Osserva i file tema matugen (bioma.css, noctalia.css): in Auto la palette si
         // aggiorna live quando cambia il tema di sistema.
         let theme_watcher = {
             let input = sender.input_sender().clone();

@@ -71,7 +71,8 @@ I cinque effetti, ciascuno con un tema (colori automatici) e uno sfondo diversi:
 - **Layout speculare stereo**: centro = basse frequenze, bordi/lati = alte;
   metà sinistra = canale L, metà destra = canale R (in input: mirror mono).
 - **Colori**: manuali (due color picker) o **automatici** dal tema di sistema
-  (accent color di libadwaita, aggiornato live con matugen/noctalia).
+  (accent del tema matugen di Bioma o noctalia, aggiornato live; altrimenti
+  accent color di libadwaita).
 - **Sorgente** audio commutabile tra uscita (monitor) e ingresso (microfono).
 - **Gain** (moltiplicatore d'ampiezza) e **Scia** (motion blur) regolabili.
 - **Modalità solo visualizzatore**: `F11` schermo intero senza barre, `H`
