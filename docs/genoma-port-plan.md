@@ -25,7 +25,7 @@ What it does **not** give:
 - **Gain before smoothing.** Sinestesia applies gain inside `analyze`; in
   Luau it can only be applied after. Close but not identical — compare by
   eye; if it matters, add a gain option to `genoma spectrum`.
-- **Raw samples / mid-side trajectory** — needed by *Fase* (Phase).
+- **Raw samples / mid-side trajectory** — needed by *Fase* (Phase), which is dropped (§8).
 - **The stereo image** (`ImagingAnalyzer`: two extra FFTs, ITD/ILD
   crossover) — needed by *Imaging*.
 - **Mirror in input mode** is trivial in Luau (one channel on both sides).
@@ -60,8 +60,6 @@ compute grid used as a ring buffer.
 | Tunnel | compute grid as a ring of frozen spectrum shapes (64 × N rings); bass-driven travel integrated in Luau and bound as a value; stars procedural from `g_hash` with z = fract(seed − travelled) | medium |
 | Poliedro (Solid) | icosphere projected in Luau, edges (≤ 256 segments) bound as values and drawn with `g_sd_segment`; faces as a second shader or `g.path` polygons | medium — check edge count and Luau time per frame |
 | Nebulosa | compute `agents`: agent *i* has a fixed Fibonacci direction and a shell = band; radius from that band's value; shock waves as a value carrying their age; `agent_size` draws them | medium |
-| Rilievo (Terrain) | compute grid ring buffer of ~150 crests × 64 bands, fixed-rate scroll; fragment shader projects rows with depth fog | medium–high |
-| Fase (Phase) | **deferred** (decided 2026-11-18): not ported in this plan; needs raw mid/side samples Genoma does not give | — |
 | Imaging | needs the imaging analysis from Genoma (§5), then three lobes drawn as polar SDFs | high — blocked |
 
 **Scia (trail / motion blur).** Sinestesia draws a translucent black quad
@@ -71,7 +69,7 @@ frame, or (better) a Genoma feature — a `pass` shader that can read its own
 previous output (`g_previous(p)`). See §5.
 
 **Fixed 60 Hz simulation step** (`VizState.steps`, catch-up capped at 4).
-Effects with state (Tunnel, Nebula, Terrain) step from `shader.time` / the
+Effects with state (Tunnel, Nebula) step from `shader.time` / the
 simulation's `steps` rate, not from frames drawn, so the result does not
 depend on the refresh rate.
 
@@ -133,11 +131,11 @@ asks for it — the "only while held" rule extended to each extra analysis.
    Compare each side by side with the GTK version on the same music.
 3. **Colours**: automatic from the shared theme file (live), the kit's
    `color_picker` for manual.
-4. **State effects**: Tunnel, Nebula, Terrain, Solid — each prototyped alone
+4. **State effects**: Tunnel, Nebula, Solid — each prototyped alone
    first in a scratch dir, measured with `genoma ipc genoma profile on`
    against the GTK version's CPU/GPU cost.
 5. **Imaging**: extend `genoma spectrum` with the imaging frame, then the
-   effect. (Fase is deferred, see §3.)
+   effect.
 6. **Viewer-only mode + packaging**: F11/H/Esc, `.desktop` with
    `Exec=genoma <app dir>`, AUR package depending on `genoma`.
 
@@ -152,11 +150,9 @@ for Bioma's cells.
   apps do (§4).
 - Sinestesia stays a separate app; it is not merged into Bioma.
 - Genoma prerequisites come first (fullscreen request first: both apps need it).
-- Fase and its `spectrum` extension are deferred.
+- 2026-11-20: Rilievo (Terrain) and Fase (Phase) are dropped from the port (they were deferred first): he does not like them. Eleven effects become nine on Genoma.
 
 ## 9. Later
 
 - Effects that are only possible in Genoma (morph between effects, glass
   over the visual) — after parity, not before.
-- Fase, if it comes back: mid/side samples from `genoma spectrum`, a ring of
-  segments in a compute grid, drawn as ribbons.

@@ -18,22 +18,10 @@ local STEP = 1 / 60
 function M.new(t: { [string]: any }): { [string]: any }
     local rings: { { [string]: any } } = {}
     local emit = 0
-    local bass_env = 0
     local drive = g.signal({ bass = 0, punch = 0, gate = 0 })
     local version = g.signal(0)
 
-    -- Bassi (le prime 12 bande dei due canali), il colpo sopra la loro media
-    -- lenta, e il cancello del silenzio (Sinestesia, audio_drive).
-    local function audio_drive(l: { number }, r: { number }): (number, number, number)
-        local sum, peak = 0, 0
-        for i = 1, 12 do sum += (l[i] or 0) + (r[i] or 0) end
-        for i = 1, 64 do peak = math.max(peak, l[i] or 0, r[i] or 0) end
-        local bass = math.clamp(sum / 24, 0, 1)
-        local gate = math.clamp((peak - 0.05) / 0.12, 0, 1)
-        bass_env += (bass - bass_env) * 0.05
-        local punch = math.clamp((bass - bass_env) * 2.5, 0, 1)
-        return bass, punch, gate
-    end
+    local audio_drive = require("effects/drive").new()
 
     -- La sagoma alla nascita: una banda ogni due, il destro dall'alto in
     -- basso poi il sinistro risalendo, 64 altezze 0..255.

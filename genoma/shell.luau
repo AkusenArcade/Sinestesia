@@ -136,6 +136,24 @@ local tunnel = require("effects/tunnel").new {
     active = function() return get("effect") == "tunnel" end,
     sounding = function() return alive.value end,
 }
+local nebula = require("effects/nebula").new {
+    bands = gained,
+    active = function() return get("effect") == "nebula" end,
+    sounding = function() return alive.value end,
+}
+local function nebula_values(): { number }
+    local l, r = channels()
+    local out = table.create(160, 0)
+    for i = 1, 64 do
+        out[i] = l[i] or 0
+        out[64 + i] = r[i] or 0
+    end
+    colours_into(out)
+    out[135] = get("gain")
+    nebula.fill(out)
+    return out
+end
+
 local function tunnel_values(): { number }
     local out = table.create(140 + 26 * 35, 0)
     colours_into(out)
@@ -146,6 +164,8 @@ end
 -- ---- Gli effetti ------------------------------------------------------------------
 
 -- Nell'ordine del menu della versione GTK; `src` per quelli già portati.
+-- Rilievo e Fase non vengono portati (Akusen, 2026-11-20): un config che
+-- li nomina mostra il primo.
 local EFFECTS = {
     { key = "bars", label = "Barre", src = "effects/bars.wgsl" },
     { key = "line", label = "Linea", src = "effects/line.wgsl" },
@@ -155,9 +175,7 @@ local EFFECTS = {
     { key = "tunnel", label = "Tunnel", src = "effects/tunnel.wgsl", values = tunnel_values },
     { key = "solid", label = "Poliedro" },
     { key = "imaging", label = "Imaging" },
-    { key = "terrain", label = "Rilievo" },
-    { key = "phase", label = "Fase" },
-    { key = "nebula", label = "Nebulosa" },
+    { key = "nebula", label = "Nebulosa", compute = "effects/nebula.wgsl", values = nebula_values },
 }
 local function effect_index(): number
     for i, e in EFFECTS do
@@ -168,7 +186,21 @@ end
 
 local layers: { any } = {}
 for _, e in EFFECTS do
-    if e.src then
+    if e.compute then
+        -- Un campo di luci: una simulazione ad agenti che Genoma disegna,
+        -- ciascuno nel suo colore, come un punto che brilla.
+        table.insert(layers, g.shader {
+            present = function() return get("effect") == e.key end,
+            grow = 1,
+            compute = g.dir .. "/" .. e.compute,
+            agents = 26 * 120,
+            agent_size = 8,
+            agent_colors = true,
+            agent_glow = true,
+            clock = function() return alive.value end,
+            values = e.values,
+        })
+    elseif e.src then
         table.insert(layers, g.shader {
             present = function() return get("effect") == e.key end,
             grow = 1,
@@ -306,7 +338,7 @@ table.insert(particles, g.emitter {
 
 local function unported(): string?
     local e = EFFECTS[effect_index()]
-    if e.src then return nil end
+    if e.src or e.compute then return nil end
     return e.label .. ": non ancora su Genoma"
 end
 
@@ -378,7 +410,7 @@ for _, e in EFFECTS do
     table.insert(chips, ui.chip {
         label = e.label,
         chosen = function() return get("effect") == e.key end,
-        dimmed = function() return e.src == nil end,
+        dimmed = function() return e.src == nil and e.compute == nil end,
         on_click = function() set("effect", e.key) end,
     })
 end
