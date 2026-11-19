@@ -1,0 +1,6 @@
+#!/bin/sh
+# Lancia Sinestesia: l'app Genoma in SINESTESIA_DIR (quella del pacchetto
+# di default). Un socket IPC suo, per non incontrare la shell né altre app
+# Genoma: `GENOMA_IPC=sinestesia genoma ipc …`.
+dir="${SINESTESIA_DIR:-/usr/share/sinestesia}"
+GENOMA_IPC="${GENOMA_IPC:-sinestesia}" exec genoma "$dir" "$@"

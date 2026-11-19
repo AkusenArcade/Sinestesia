@@ -2,7 +2,7 @@
 Type=Application
 Name=Sinestesia
 GenericName=Visualizzatore audio
-Comment=Visualizzatore audio per Linux con effetti e theming di sistema
+Comment=Visualizzatore audio per Linux, su Genoma nello stile di Bioma
 Exec=sinestesia
 Icon=dev.akusen.sinestesia
 Terminal=false

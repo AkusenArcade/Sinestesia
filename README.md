@@ -1,109 +1,75 @@
 # Sinestesia
 
-Visualizzatore audio per Linux scritto in **Rust** con **Relm4 / GTK4 + libadwaita**.
-Cattura l'audio di sistema (output o input) via **PipeWire**, ne analizza lo spettro in
-tempo reale (FFT) e lo rende con effetti fluidi su **OpenGL** (GtkGLArea).
+Visualizzatore audio per Linux. Dalla 1.0 è un'app **Genoma** (Rust + Luau,
+`~/Documents/Development/Genoma`) nello stile di **Bioma**: gli effetti sono
+shader e simulazioni sulla GPU, l'audio lo cattura Genoma (`genoma spectrum`,
+PipeWire), l'interfaccia segue il tema del desktop.
 
 ![icona](assets/sinestesia.svg)
 
-## Screenshot
+> **La versione GTK è deprecata.** Fino alla 0.6.2 Sinestesia era scritta in
+> Rust con Relm4 / GTK4 + libadwaita e disegnava su OpenGL; i sorgenti restano
+> in `src/` come riferimento, ma non vengono più compilati né pacchettizzati.
 
-I cinque effetti, ciascuno con un tema (colori automatici) e uno sfondo diversi:
+## Effetti
 
-| Barre | Linea |
-|:-:|:-:|
-| ![Barre](assets/screenshots/bars.png) | ![Linea](assets/screenshots/line.png) |
-| **Radiale** | **Radiale Spettro** |
-| ![Radiale](assets/screenshots/radial.png) | ![Radiale Spettro](assets/screenshots/radialspectrum.png) |
+- *Barre*, *Linea*, *Radiale* (con le particelle che escono dai raggi che
+  salgono), *Linea Spettro* e *Radiale Spettro* (riempimento tenue e bordo neon
+  visibile quanto il volume).
+- *Tunnel*: anelli che congelano la sagoma dello spettro e corrono verso chi
+  guarda avvitandosi, con un campo di stelle; i bassi accelerano corsa e vortice.
+- *Poliedro*: icosaedro geodetico gonfiato dallo spettro (la latitudine dà la
+  frequenza, l'emisfero il canale); i bassi lo avvicinano, i colpi staccano le
+  facce.
+- *Nebulosa*: migliaia di luci su gusci sferici, i bassi al centro e gli acuti
+  in superficie; i colpi lanciano onde d'urto, la profondità dà la luce.
+- *Imaging*: l'immagine stereo davanti all'ascoltatore, in forme organiche: tre
+  lobi (bassi, medi, alti) come cellule, la membrana nitida quanto il suono è
+  localizzato e sfumata quanto è diffuso, e una spora per banda nella sua
+  direzione. L'analisi stereo si chiede a Genoma solo mentre l'effetto è scelto.
 
-**Linea Spettro** — variante neon, bordo luminoso a visibilità proporzionale al volume:
+Layout speculare: centro = basse, bordi = alte; metà sinistra = canale L. In
+ingresso il microfono, mono, è specchiato sui due lati.
 
-![Linea Spettro](assets/screenshots/linespectrum.png)
+## Uso
 
-## Caratteristiche
+- I controlli non si vedono finché non servono: la capsula in basso apre la
+  cella con effetto, sorgente (uscita o ingresso), colori (dal tema o scelti),
+  gain e scia (motion blur).
+- `F11` schermo intero, `H` nasconde la capsula, `Esc` chiude la cella o torna
+  in finestra. La finestra si chiude dal compositor.
+- Colori automatici e caratteri vengono dal tema condiviso che Bioma scrive
+  (`~/.config/genoma/theme.json`): l'accento e la sua tinta schiarita.
+- Impostazioni in `~/.config/sinestesia/config.json`; al primo avvio quelle
+  della versione GTK (`config.toml`) vengono migrate.
 
-- **Effetti** selezionabili a runtime:
-  - *Barre* (stile Cava)
-  - *Linea* (curva dello spettro)
-  - *Radiale* (spettro ad anello con particelle)
-  - *Linea Spettro* e *Radiale Spettro* (varianti "neon": riempimento trasparente,
-    bordo luminoso da 1px, bagliore; outline a visibilità proporzionale al volume)
-  - *Tunnel* (anelli che congelano la sagoma dello spettro e sfrecciano verso
-    l'osservatore avvitandosi, più campo di stelle; le basse frequenze
-    accelerano corsa, vortice ed emissione — ottimo con la Scia alzata)
-  - *Poliedro* (solido geodetico 3D con spigoli luminosi: la latitudine dà la
-    frequenza e l'emisfero il canale, i bassi lo avvicinano alla camera e i
-    transienti fanno esplodere le facce verso l'esterno)
-  - *Nebulosa* (campo di migliaia di particelle su gusci sferici concentrici,
-    uno per fascia di frequenza: i bassi al centro, gli acuti in superficie. Le
-    direzioni sono fisse (spirale di Fibonacci) e a muoversi è solo il raggio,
-    spinto dall'energia di banda, così il campo respira invece di formicolare.
-    I transienti lanciano onde d'urto radiali che si propagano dal centro verso
-    l'esterno; ruota su due assi con parallasse vera e il bagliore cala con la
-    profondità, che è ciò che fa leggere il volume come sfera e non come disco)
-  - *Rilievo* (spettrogramma 3D: ogni frame nasce una cresta in primo piano con
-    la sagoma dello spettro e le vecchie scorrono verso l'orizzonte sfumando
-    nella foschia, così restano visibili ~2,5 s di storia — il picco di due
-    secondi fa è ancora lì, come montagna in fondo. L'asse in profondità è il
-    tempo e scorre a passo fisso: accelerarlo sui bassi vorrebbe dire deformare
-    l'asse dei tempi. I bassi avvicinano la camera, i transienti restano
-    impressi nella cresta che nasce in quel momento e si allontanano con lei)
-  - *Fase* (vettorscopio esteso nel tempo: X = side, Y = mid, Z = tempo. La
-    traiettoria mid/side della forma d'onda — l'unico effetto che disegna il
-    segnale invece dello spettro — diventa un nastro che si avvita in
-    profondità mentre la camera oscilla su due assi. Un crossover a due tagli
-    (250 Hz, 2,5 kHz) la separa in tre nastri concentrici: i bassi stretti
-    attorno all'asse, medi e alti via via più larghi e mossi, così la parte
-    stereo risalta invece di sparire in un unico filo. Mono = fili verticali,
-    stereo largo = spirali che si aprono, controfase = nastro rovesciato sulla
-    diagonale. I bassi avvicinano la camera)
-  - *Imaging* (immagine stereo frontale: semicerchio con l'ascoltatore al
-    centro della corda, ogni banda posizionata nella direzione da cui è
-    percepita, e tre lobi separati per bassi / medi / alti — sotto i 250 Hz la
-    localizzazione è debole e il mix tiene quasi sempre i bassi al centro,
-    quindi un lobo unico li lasciava coprire proprio la parte direzionale. L'azimut combina differenza di tempo e di ampiezza secondo la
-    teoria duplex e passa per la legge della tangente; l'arco disegnato *è* il
-    palco stereo, quindi i suoi estremi sono i due diffusori (±30° reali) e un
-    pan tutto a destra finisce sul bordo destro. Niente metà posteriore:
-    da due canali il fronte/retro non è ricostruibile, e l'energia decorrelata
-    — riverbero, ambienza — non ha direzione, quindi allarga il lobo invece di
-    spostarsi da un lato)
-- **Layout speculare stereo**: centro = basse frequenze, bordi/lati = alte;
-  metà sinistra = canale L, metà destra = canale R (in input: mirror mono).
-- **Colori**: manuali (due color picker) o **automatici** dal tema di sistema
-  (accent del tema matugen di Bioma o noctalia, aggiornato live; altrimenti
-  accent color di libadwaita).
-- **Sorgente** audio commutabile tra uscita (monitor) e ingresso (microfono).
-- **Gain** (moltiplicatore d'ampiezza) e **Scia** (motion blur) regolabili.
-- **Modalità solo visualizzatore**: `F11` schermo intero senza barre, `H`
-  nasconde/mostra header bar e pannello controlli restando in finestra, `Esc`
-  ripristina tutto.
-- Impostazioni persistenti in `~/.config/sinestesia/config.toml`.
-- L'UI segue automaticamente il tema GTK di sistema (libadwaita).
+## Installazione
 
-## Requisiti
+Dall'AUR: `sinestesia` (dipende da `genoma`).
 
-- Rust (edition 2021)
-- PipeWire, GTK4, libadwaita, libepoxy (header di sviluppo)
-- Un compositor con OpenGL/EGL (Wayland o X11)
-
-## Build ed esecuzione
-
-```sh
-cargo run --release
-```
-
-## Installazione (menu applicazioni)
+A livello utente, con `genoma` già installato:
 
 ```sh
 ./install.sh
 ```
 
-Installa il binario in `~/.local/bin`, la voce `.desktop` e l'icona in `~/.local/share`.
+Copia l'app in `~/.local/share/sinestesia` e mette il lanciatore in
+`~/.local/bin`, con la voce `.desktop` e l'icona.
+
+## Sviluppo
+
+```sh
+genoma genoma/                 # dal checkout, ricaricata a ogni salvataggio
+genoma/tools/effects           # rigenera gli shader da effects/source/
+genoma check genoma/           # controlla Luau e WGSL
+```
+
+L'icona è generata con `tools/app-icon` di Bioma dal glifo `sinestesia.svg`.
 
 ## Documentazione
 
-Le specifiche complete sono in [`PRD.md`](PRD.md).
+Il piano del passaggio a Genoma è in [`docs/genoma-port-plan.md`](docs/genoma-port-plan.md);
+le specifiche originali in [`PRD.md`](PRD.md).
 
 ## Licenza
 
