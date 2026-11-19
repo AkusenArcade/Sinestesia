@@ -154,6 +154,24 @@ local function nebula_values(): { number }
     return out
 end
 
+local solid = require("effects/solid").new {
+    bands = gained,
+    active = function() return get("effect") == "solid" end,
+    sounding = function() return alive.value end,
+}
+local function solid_values(): { number }
+    local l, r = channels()
+    local out = table.create(946, 0)
+    for i = 1, 64 do
+        out[i] = l[i] or 0
+        out[64 + i] = r[i] or 0
+    end
+    colours_into(out)
+    out[135] = get("gain")
+    solid.fill(out)
+    return out
+end
+
 local function tunnel_values(): { number }
     local out = table.create(140 + 26 * 35, 0)
     colours_into(out)
@@ -173,7 +191,7 @@ local EFFECTS = {
     { key = "linespectrum", label = "Linea Spettro", src = "effects/line_spectrum.wgsl" },
     { key = "radialspectrum", label = "Radiale Spettro", src = "effects/radial_spectrum.wgsl" },
     { key = "tunnel", label = "Tunnel", src = "effects/tunnel.wgsl", values = tunnel_values },
-    { key = "solid", label = "Poliedro" },
+    { key = "solid", label = "Poliedro", compute = "effects/solid.wgsl", drawn = true, agents = solid.agents, values = solid_values },
     { key = "imaging", label = "Imaging" },
     { key = "nebula", label = "Nebulosa", compute = "effects/nebula.wgsl", values = nebula_values },
 }
@@ -189,14 +207,16 @@ for _, e in EFFECTS do
     if e.compute then
         -- Un campo di luci: una simulazione ad agenti che Genoma disegna,
         -- ciascuno nel suo colore, come un punto che brilla.
+        -- `drawn`: la simulazione la disegna il suo `shade` (il Poliedro);
+        -- altrimenti Genoma disegna gli agenti come luci (la Nebulosa).
         table.insert(layers, g.shader {
             present = function() return get("effect") == e.key end,
             grow = 1,
             compute = g.dir .. "/" .. e.compute,
-            agents = 26 * 120,
-            agent_size = 8,
-            agent_colors = true,
-            agent_glow = true,
+            agents = e.agents or 26 * 120,
+            agent_size = if e.drawn then 0 else 8,
+            agent_colors = not e.drawn,
+            agent_glow = not e.drawn,
             clock = function() return alive.value end,
             values = e.values,
         })
