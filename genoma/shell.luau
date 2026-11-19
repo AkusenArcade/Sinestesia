@@ -80,9 +80,18 @@ local function colour_b(): string
     return get("color_b")
 end
 
+-- I due canali. In ingresso il microfono è mono: arriva su un canale solo
+-- (la Revelator ne dà sei), e lo si specchia sui due lati, come la
+-- versione GTK.
+local function channels(): ({ number }, { number })
+    local l = spectrum.left
+    if get("source") == "input" then return l, l end
+    return l, spectrum.right
+end
+
 -- Quello che ogni effetto legge: 128 bande, i due colori, il gain, il picco.
 local function values(): { number }
-    local l, r = spectrum.left, spectrum.right
+    local l, r = channels()
     local gain = get("gain")
     local out = table.create(136, 0)
     local peak = 0
@@ -158,8 +167,11 @@ local area = g.signal({ w = 1100, h = 560 })
 local rise = g.signal(table.create(128, 0))
 do
     local before = table.create(128, 0)
+    local settle: any = nil
     g.watch(function() return spectrum.left end, function()
-        local l, r = g.untracked(function() return spectrum.left end), g.untracked(function() return spectrum.right end)
+        -- g.untracked dà un valore solo: i due canali in una tabella.
+        local both = g.untracked(function() local a, b = channels() return { a, b } end)
+        local l, r = both[1], both[2]
         local gain = g.untracked(function() return get("gain") end)
         local out = table.create(128, 0)
         for i = 1, 64 do
@@ -171,6 +183,14 @@ do
             end
         end
         rise.value = out
+        -- Una salita vale per il passo in cui avviene: se entro un passo non
+        -- arriva uno spettro nuovo (silenzio, lo stesso spettro di prima),
+        -- le punte smettono di sparare.
+        if settle then settle:stop() end
+        settle = g.after(1.5 / 60, function()
+            settle = nil
+            rise.value = table.create(128, 0)
+        end)
     end)
 end
 local function radial_on(): boolean
@@ -187,7 +207,8 @@ for k = 1, 128 do
     local angle = if right then math.pi / 2 - i / 63 * math.pi else math.pi / 2 + i / 63 * math.pi
     local function tip(): (number, number)
         local a = area.value
-        local raw = (if right then spectrum.right else spectrum.left)[i + 1] or 0
+        local l, r = channels()
+        local raw = (if right then r else l)[i + 1] or 0
         local band = raw * get("gain")
         local r = (0.28 + math.clamp(band, 0, 1) * 0.62) * a.h / 2
         return a.w / 2 + math.cos(angle) * r, a.h / 2 - math.sin(angle) * r
@@ -251,120 +272,241 @@ local stage = g.capsule {
     },
 }
 
--- ---- I controlli -------------------------------------------------------------------
+-- ---- I controlli: una cella fluttuante -----------------------------------------------
+--
+-- Di solito non si vedono: c'è solo una piccola capsula col glifo di
+-- Sinestesia in basso. Premuta, la cella cresce da lei, come le
+-- espansioni di Bioma; si chiude ripremendola, con Esc o premendo fuori.
 
-local function label(text: string): any
-    return g.text {
-        text = text,
-        size = function() return theme.get("text_size") end,
-        color = function() return theme.get("text") end,
+local look = require("ui/look")
+local ui = require("ui/controls")
+
+g.timing_default {
+    cell_open = { duration = 0.32, curve = { 0.2, 0.9, 0.3, 1.05 } },
+    cell_close = { duration = 0.2, curve = { 0.4, 0, 0.6, 1 } },
+    content_in = { duration = 0.16, delay = 0.18, curve = { 0.2, 0, 0, 1 } },
+    content_out = { duration = 0.08, curve = { 0.4, 0, 1, 1 } },
+    panel_fade = { duration = 0.1, curve = { 0.2, 0, 0, 1 } },
+}
+
+-- Volutamente non salvati: si riapre sempre in finestra, con il bottone.
+local whole = g.signal(false)
+local chrome = g.signal(true)
+local open = g.signal(false)
+local PANEL_W, LABEL_W, GAP = 560, 92, 16
+local SLIDER_W = PANEL_W - 2 * 22 - LABEL_W - 56
+
+local function row(name: string, ...: any): any
+    return g.box {
+        direction = "row",
+        align = "center",
+        gap = 12,
+        g.box { width = LABEL_W, ui.label(name) },
+        ...,
     }
 end
-local function figure(text: () -> string): any
-    return g.text {
-        text = text,
-        size = function() return theme.get("text_size") end,
-        color = function() return theme.get("faint") end,
-        tabular = true,
+
+local chips: { [any]: any } = { direction = "row", flow = true, gap = 6, width = PANEL_W - 2 * 22 - LABEL_W - 12 }
+for _, e in EFFECTS do
+    table.insert(chips, ui.chip {
+        label = e.label,
+        chosen = function() return get("effect") == e.key end,
+        dimmed = function() return e.src == nil end,
+        on_click = function() set("effect", e.key) end,
+    })
+end
+
+local function swatch(which: string, colour: () -> string): any
+    return kit.color_picker.button {
+        name = "Colore " .. which,
+        color = colour,
+        on_change = function(hex: string)
+            set("color_mode", "manual")
+            set(if which == "A" then "color_a" else "color_b", hex)
+        end,
     }
 end
-local function separator(): any
-    return g.capsule { width = 1, height = 22, radius = 0, fill = function() return theme.get("line") end }
-end
--- Con la virgola, come la versione GTK in italiano.
+
+local GAIN_MIN, GAIN_MAX = 0.1, 10
 local function decimal(v: number, digits: number): string
     local s = string.format("%." .. digits .. "f", v)
     return (string.gsub(s, "%.", ","))
 end
 
-local GAIN_MIN, GAIN_MAX = 0.1, 10
-
-local controls = g.capsule {
-    radius = 0,
-    fill = function() return theme.get("background") end,
-    direction = "row",
-    align = "center",
-    gap = 10,
-    padding_x = 12,
-    height = 52,
-    label("Effetto"),
-    kit.dropdown {
-        width = 150,
-        options = function()
-            local out = {}
-            for _, e in EFFECTS do table.insert(out, e.label) end
-            return out
-        end,
-        selected = effect_index,
-        on_select = function(i: number) set("effect", EFFECTS[i].key) end,
-    },
-    separator(),
-    label("Uscita"),
-    kit.toggle {
-        name = "Ingresso",
-        on = function() return get("source") == "input" end,
-        on_toggle = function(on: boolean) set_source(if on then "input" else "output") end,
-    },
-    label("Ingresso"),
-    separator(),
-    label("Tema auto"),
-    kit.toggle {
-        name = "Tema auto",
-        on = function() return get("color_mode") == "auto" end,
-        on_toggle = function(on: boolean) set("color_mode", if on then "auto" else "manual") end,
-    },
+local content = g.box {
+    direction = "column",
+    align = "stretch",
+    gap = GAP,
+    padding = 22,
+    opacity = function() return if open.value then 1 else 0 end,
+    transition = { opacity = function() return if open.value then "content_in" else "content_out" end },
     g.box {
         direction = "row",
-        gap = 8,
-        opacity = function() return if get("color_mode") == "auto" then theme.get("disabled_opacity") else 1 end,
-        kit.color_picker.button { name = "Colore A", color = colour_a, on_change = function(hex: string)
-            set("color_mode", "manual")
-            set("color_a", hex)
-        end },
-        kit.color_picker.button { name = "Colore B", color = colour_b, on_change = function(hex: string)
-            set("color_mode", "manual")
-            set("color_b", hex)
-        end },
+        align = "start",
+        gap = 12,
+        g.box { width = LABEL_W, height = 26, direction = "row", align = "center", ui.label("Effetto") },
+        g.box(chips),
     },
-    separator(),
-    label("Gain"),
-    kit.slider {
+    row("Sorgente", ui.segmented {
+        options = function() return { { key = "output", label = "Uscita" }, { key = "input", label = "Ingresso" } } end,
+        current = function() return get("source") end,
+        on_choose = set_source,
+    }),
+    row("Colori", ui.segmented {
+        options = function() return { { key = "auto", label = "Tema" }, { key = "manual", label = "Scelti" } } end,
+        current = function() return get("color_mode") end,
+        on_choose = function(key: string) set("color_mode", key) end,
+    }, swatch("A", colour_a), swatch("B", colour_b)),
+    row("Gain", ui.slider {
         name = "Gain",
-        width = 120,
+        width = SLIDER_W,
         step = 0.1 / (GAIN_MAX - GAIN_MIN),
         value = function() return (get("gain") - GAIN_MIN) / (GAIN_MAX - GAIN_MIN) end,
-        on_change = function(v: number)
+        on_move = function(v: number)
             set("gain", math.floor((GAIN_MIN + v * (GAIN_MAX - GAIN_MIN)) * 10 + 0.5) / 10)
         end,
-    },
-    figure(function() return decimal(get("gain"), 1) end),
-    label("Scia"),
-    kit.slider {
+    }, ui.figure(function() return decimal(get("gain"), 1) end)),
+    row("Scia", ui.slider {
         name = "Scia",
-        width = 120,
+        width = SLIDER_W,
         step = 0.05 / 0.95,
         value = function() return get("blur") / 0.95 end,
-        on_change = function(v: number) set("blur", math.floor(v * 0.95 * 100 + 0.5) / 100) end,
+        on_move = function(v: number) set("blur", math.floor(v * 0.95 * 100 + 0.5) / 100) end,
+    }, ui.figure(function() return decimal(get("blur"), 2) end)),
+}
+
+-- Quanto è alta la cella aperta: quello che contiene.
+local panel_h = g.signal(300)
+
+local BUTTON = look.cell_height
+local MARGIN = 18
+local GAP_UP = 10
+
+-- Il pannello c'è mentre è aperto e finché si chiude: tolto dopo, perché
+-- anche invisibile prenderebbe le pressioni (il hit-test di Genoma non
+-- guarda né il clip né l'opacità).
+local panel_out = g.signal(false)
+local putting_away: any = nil
+g.watch(function() return open.value end, function(on: boolean)
+    if putting_away then putting_away:stop() end
+    putting_away = nil
+    if on then
+        panel_out.value = true
+    else
+        putting_away = g.after(0.3, function()
+            putting_away = nil
+            panel_out.value = false
+        end)
+    end
+end)
+
+local function button_x(): number return (area.value.w - BUTTON) / 2 end
+local function button_y(): number return area.value.h - MARGIN - BUTTON end
+
+-- La cella aperta: nasce dal bottone e sale sopra di lui.
+local panel = g.capsule {
+    name = "Controlli",
+    overlay = true,
+    attach = "corner",
+    present = function() return panel_out.value and chrome.value end,
+    offset_x = function()
+        return if open.value then (area.value.w - PANEL_W) / 2 else button_x()
+    end,
+    offset_y = function()
+        return if open.value then button_y() - GAP_UP - panel_h.value else button_y()
+    end,
+    width = function() return if open.value then PANEL_W else BUTTON end,
+    height = function() return if open.value then panel_h.value else BUTTON end,
+    radius = function() return if open.value then look.radius_panel else BUTTON / 2 end,
+    opacity = function() return if open.value then 1 else 0 end,
+    clip = true,
+    fill = look.glass,
+    rim_top = look.rim,
+    rim_bottom = look.line,
+    backdrop_blur = 14,
+    transition = {
+        offset_x = function() return if open.value then "cell_open" else "cell_close" end,
+        offset_y = function() return if open.value then "cell_open" else "cell_close" end,
+        width = function() return if open.value then "cell_open" else "cell_close" end,
+        height = function() return if open.value then "cell_open" else "cell_close" end,
+        radius = function() return if open.value then "cell_open" else "cell_close" end,
+        opacity = function() return if open.value then "panel_fade" else "cell_close" end,
     },
-    figure(function() return decimal(get("blur"), 2) end),
+    -- Le pressioni sul vetro restano al vetro.
+    on_press = function() end,
+    on_click = function() end,
+    g.box {
+        overlay = true,
+        attach = "corner",
+        width = PANEL_W,
+        on_size = function(_: number, h: number) panel_h.value = h end,
+        content,
+    },
+}
+
+-- Il bottone: c'è sempre (salvo F11 e H), apre e chiude.
+local button = g.capsule {
+    id = "controls",
+    role = "button",
+    name = "Controlli",
+    overlay = true,
+    attach = "corner",
+    present = function() return chrome.value end,
+    offset_x = button_x,
+    offset_y = button_y,
+    width = BUTTON,
+    height = BUTTON,
+    radius = BUTTON / 2,
+    fill = function() return if open.value then g.colour.alpha(look.primary(), 0.16) else look.glass() end,
+    rim_top = function() return if open.value then look.primary() else look.rim() end,
+    rim_bottom = function() return if open.value then look.primary() else look.line() end,
+    backdrop_blur = 14,
+    transition = { fill = "ui_change", rim_top = "ui_change", rim_bottom = "ui_change" },
+    on_press = function() end,
+    on_click = function() open.value = not g.untracked(function() return open.value end) end,
+    g.svg {
+        overlay = true,
+        attach = "corner",
+        offset_x = (BUTTON - 18) / 2,
+        offset_y = (BUTTON - 18) / 2,
+        width = 18,
+        height = 18,
+        src = g.dir .. "/icons/sinestesia.svg",
+        -- Tinto come i glifi di Bioma: il primario, chiaro in alto e scuro in
+        -- basso.
+        gradient_top = function() return look.gradient_top(look.primary()) end,
+        gradient_bottom = function() return look.gradient_bottom(look.primary()) end,
+    },
+}
+
+-- Una pressione fuori dalla cella aperta la chiude.
+local outside = g.box {
+    overlay = true,
+    attach = "corner",
+    present = function() return open.value end,
+    width = function() return area.value.w end,
+    height = function() return area.value.h end,
+    on_click = function() open.value = false end,
 }
 
 -- ---- La finestra ----------------------------------------------------------------------
-
--- Volutamente non salvati: si riapre sempre in finestra, con i controlli.
-local whole = g.signal(false)
-local chrome = g.signal(true)
 
 local function key(name: string, text: string?)
     if name == "F11" then
         local on = not g.untracked(function() return whole.value end)
         whole.value = on
         chrome.value = not on
+        if on then open.value = false end
     elseif text == "h" or text == "H" then
         chrome.value = not g.untracked(function() return chrome.value end)
+        if not chrome.value then open.value = false end
     elseif name == "Escape" then
-        whole.value = false
-        chrome.value = true
+        if g.untracked(function() return open.value end) then
+            open.value = false
+        else
+            whole.value = false
+            chrome.value = true
+        end
     end
 end
 
@@ -388,18 +530,9 @@ return g.window {
         fill = "#000000",
         catch = true,
         on_key = key,
-        g.box {
-            present = function() return chrome.value end,
-            direction = "column",
-            align = "stretch",
-            kit.titlebar { title = "Sinestesia", on_close = function() g.quit() end },
-        },
         stage,
-        g.box {
-            present = function() return chrome.value end,
-            direction = "column",
-            align = "stretch",
-            controls,
-        },
+        outside,
+        panel,
+        button,
     },
 }
