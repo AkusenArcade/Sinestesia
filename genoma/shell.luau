@@ -110,6 +110,39 @@ local function values(): { number }
     return out
 end
 
+-- I due canali col gain, 0..1: quello che gli effetti con uno stato
+-- leggono.
+local function gained(): ({ number }, { number })
+    local l, r = channels()
+    local gain = get("gain")
+    local gl, gr = table.create(64, 0), table.create(64, 0)
+    for i = 1, 64 do
+        gl[i] = math.clamp((l[i] or 0) * gain, 0, 1)
+        gr[i] = math.clamp((r[i] or 0) * gain, 0, 1)
+    end
+    return gl, gr
+end
+
+-- I due colori, dove ogni shader li legge (128..133).
+local function colours_into(out: { number })
+    local a = g.colour.parse(colour_a()) or { r = 1, g = 1, b = 1 }
+    local b = g.colour.parse(colour_b()) or { r = 1, g = 1, b = 1 }
+    out[129], out[130], out[131] = a.r, a.g, a.b
+    out[132], out[133], out[134] = b.r, b.g, b.b
+end
+
+local tunnel = require("effects/tunnel").new {
+    bands = gained,
+    active = function() return get("effect") == "tunnel" end,
+    sounding = function() return alive.value end,
+}
+local function tunnel_values(): { number }
+    local out = table.create(140 + 26 * 35, 0)
+    colours_into(out)
+    tunnel.fill(out)
+    return out
+end
+
 -- ---- Gli effetti ------------------------------------------------------------------
 
 -- Nell'ordine del menu della versione GTK; `src` per quelli già portati.
@@ -119,7 +152,7 @@ local EFFECTS = {
     { key = "radial", label = "Radiale", src = "effects/radial.wgsl" },
     { key = "linespectrum", label = "Linea Spettro", src = "effects/line_spectrum.wgsl" },
     { key = "radialspectrum", label = "Radiale Spettro", src = "effects/radial_spectrum.wgsl" },
-    { key = "tunnel", label = "Tunnel" },
+    { key = "tunnel", label = "Tunnel", src = "effects/tunnel.wgsl", values = tunnel_values },
     { key = "solid", label = "Poliedro" },
     { key = "imaging", label = "Imaging" },
     { key = "terrain", label = "Rilievo" },
@@ -140,7 +173,7 @@ for _, e in EFFECTS do
             present = function() return get("effect") == e.key end,
             grow = 1,
             src = g.dir .. "/" .. e.src,
-            values = values,
+            values = e.values or values,
         })
     end
 end
@@ -236,6 +269,40 @@ for k = 1, 128 do
         color_end = function() return string.sub(colour_b(), 1, 7) .. "00" end,
     })
 end
+
+-- Le stelle del Tunnel: nascono vicino al punto di fuga e corrono verso
+-- i bordi, tante e veloci quanto spinge la musica (update_tunnel: 2 + 6 ×
+-- bassi + 4 × colpo a passo, la posizione scalata di 1 + 0,004 + (0,026 +
+-- 0,055 × bassi + 0,10 × colpo) a passo, fuori a 1,6).
+local function star_growth(): number
+    local d = tunnel.drive()
+    return 0.004 + (0.026 + d.bass * 0.055 + d.punch * 0.10) * d.gate
+end
+local function star_life(): number
+    -- Passi per andare da ~0,065 a 1,6 crescendo di star_growth a passo.
+    return math.clamp(math.log(1.6 / 0.065) / math.log(1 + star_growth()) / 60, 0.4, 4)
+end
+table.insert(particles, g.emitter {
+    overlay = true,
+    attach = "corner",
+    present = function() return get("effect") == "tunnel" end,
+    offset_x = function() return area.value.w / 2 - 1 end,
+    offset_y = function() return area.value.h / 2 - 1 end,
+    width = 2,
+    height = 2,
+    rate = function()
+        local d = tunnel.drive()
+        return math.floor((2 + d.bass * 6 + d.punch * 4) * d.gate) * 60
+    end,
+    lifetime = star_life,
+    speed = function() return 1.55 * area.value.h / 2 / star_life() end,
+    spread = 360,
+    heading = 0,
+    particle_size = 2.5,
+    trail = 0.05,
+    fill = function() return string.sub(colour_a(), 1, 7) .. "30" end,
+    color_end = function() return string.sub(colour_b(), 1, 7) end,
+})
 
 local function unported(): string?
     local e = EFFECTS[effect_index()]

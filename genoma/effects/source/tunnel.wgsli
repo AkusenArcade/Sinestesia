@@ -1,0 +1,81 @@
+// Tunnel: anelli che congelano la sagoma dello spettro e si espandono
+// verso chi guarda, ciascuno ruotato di quanto ha vissuto (vortice).
+//
+// values (diversi dagli effetti 2D, oltre ai colori comuni a 128..133):
+// 0 quanti anelli; da 140, 35 per anello: scala, angolo, tinta, poi le 64
+// altezze della sagoma impaccate due a valore (a + b·256, 0..255).
+
+const RING_DEATH: f32 = 1.85;
+const RING_HALF_WIDTH: f32 = 0.012;
+const RING_BASE: i32 = 140;
+const RING_STRIDE: i32 = 35;
+
+// L'altezza n (0..63, ciclica) della sagoma dell'anello k.
+fn ring_height(k: i32, n: i32) -> f32 {
+    let m = ((n % 64) + 64) % 64;
+    let packed = value(RING_BASE + k * RING_STRIDE + 3 + m / 2);
+    let lo = packed - floor(packed / 256.0) * 256.0;
+    let hi = floor(packed / 256.0);
+    if (m % 2 == 0) {
+        return lo / 255.0;
+    }
+    return hi / 255.0;
+}
+
+// Il raggio della sagoma (raggio ~1) all'angolo phi, nel riferimento
+// dell'anello: il destro dall'alto in basso, il sinistro risale.
+fn shape_radius(k: i32, phi: f32) -> f32 {
+    var n: f32;
+    if (cos(phi) >= 0.0) {
+        n = clamp((PI * 0.5 - phi) / PI * 31.5, 0.0, 31.5);
+    } else {
+        var pl = phi;
+        if (pl < 0.0) {
+            pl = pl + 2.0 * PI;
+        }
+        let v = clamp((pl - PI * 0.5) / PI * 31.5, 0.0, 31.5);
+        n = 63.0 - v;
+    }
+    let i = i32(floor(n));
+    let t = n - floor(n);
+    let h = clamp(catmull(ring_height(k, i - 1), ring_height(k, i), ring_height(k, i + 1), ring_height(k, i + 2), t), 0.0, 1.0);
+    return 0.72 + h * 0.55;
+}
+
+// Appare dal punto di fuga, piena per la traversata, sfuma uscendo.
+fn ring_brightness(scale: f32) -> f32 {
+    return clamp(scale / 0.28, 0.0, 1.0) * clamp((RING_DEATH - scale) / 0.75, 0.0, 1.0);
+}
+
+fn shade(p: vec2<f32>) -> vec4<f32> {
+    let q = polar_q(p);
+    let rho = length(q);
+    let theta = atan2(q.y, q.x);
+    let count = i32(value(0));
+    var rgb = vec3<f32>(0.0);
+    for (var k = 0; k < count; k = k + 1) {
+        let base = RING_BASE + k * RING_STRIDE;
+        let scale = value(base);
+        let angle = value(base + 1);
+        let tint = value(base + 2);
+        let bright = ring_brightness(scale);
+        let w = RING_HALF_WIDTH * (0.35 + scale);
+        // Fuori dalla fascia che la sagoma può toccare: niente da fare.
+        if (bright <= 0.002 || rho < scale * 0.72 - w || rho > scale * 1.27 + w) {
+            continue;
+        }
+        let phi = theta - angle;
+        let r = scale * shape_radius(k, phi);
+        let e = 0.01;
+        let dr = scale * (shape_radius(k, phi + e) - shape_radius(k, phi - e)) / (2.0 * e);
+        let d = abs(rho - r) / sqrt(1.0 + (dr / max(rho, 1e-3)) * (dr / max(rho, 1e-3))) / w;
+        if (d >= 1.0) {
+            continue;
+        }
+        // Come lo shader del tunnel di Sinestesia: nucleo netto e alone.
+        let core = smoothstep(0.30, 0.0, d);
+        let halo = (1.0 - d) * (1.0 - d) * (1.0 - d) * 0.45;
+        rgb = rgb + mix(col_a(), col_b(), clamp(tint, 0.0, 1.0)) * bright * (core + halo);
+    }
+    return vec4<f32>(rgb, clamp(max(rgb.r, max(rgb.g, rgb.b)), 0.0, 1.0));
+}
