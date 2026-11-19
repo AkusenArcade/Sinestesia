@@ -1,0 +1,129 @@
+// Imaging: il semicerchio davanti all'ascoltatore, che sta al centro della
+// corda. L'arco è il palco stereo: le estremità sono i due diffusori. Tre
+// lobi, bassi, medi e alti: in ogni direzione, l'energia che arriva da lì
+// (la parte localizzata stretta attorno all'azimut, quella diffusa stesa
+// piatta sull'arco). Una luce per banda sull'arco, al suo azimut, che
+// sbiadisce quanto la banda è diffusa.
+//
+// values (diversi dagli effetti 2D): 0..63 l'azimut di ogni banda
+// (radianti, ±π/6 i diffusori), 64..127 la diffusività, 128..133 i colori,
+// 134 il gain, 140..203 l'energia.
+
+const IMG_RADIUS: f32 = 0.92;
+const IMG_Y_OFFSET: f32 = -0.46;
+const IMG_LOBE_MIN: f32 = 0.02;
+const IMG_RING_W: f32 = 0.006;
+const IMG_LOBE_W: f32 = 0.010;
+const IMG_DIR_SPREAD: f32 = 0.16;
+const IMG_STAGE_SCALE: f32 = 3.0;
+const IMG_LOBE_KNEE: f32 = 4.5;
+const IMG_LOBE_GAMMA: f32 = 0.45;
+
+fn img_energy(b: i32) -> f32 { return clamp(value(140 + b) * value(134), 0.0, 1.0); }
+fn img_diffuse(b: i32) -> f32 { return clamp(value(64 + b), 0.0, 1.0); }
+fn img_angle(b: i32) -> f32 { return clamp(value(b) * IMG_STAGE_SCALE, -PI * 0.5, PI * 0.5); }
+
+// La fascia di una banda: 0 sotto 250 Hz, 1 fino a 4 kHz, 2 sopra.
+fn img_group(b: i32) -> i32 {
+    let f = 30.0 * pow(16000.0 / 30.0, (f32(b) + 0.5) / 64.0);
+    if (f < 250.0) {
+        return 0;
+    }
+    if (f < 4000.0) {
+        return 1;
+    }
+    return 2;
+}
+
+// L'energia media del lobo g dalla direzione a (disegnata, 0 davanti), e
+// quanto è diffusa (media pesata dall'energia).
+fn lobe(g: i32, a: f32) -> vec2<f32> {
+    let inv2s2 = 1.0 / (2.0 * IMG_DIR_SPREAD * IMG_DIR_SPREAD);
+    var sum = 0.0;
+    var count = 0.0;
+    var diffuse = 0.0;
+    var weight = 0.0;
+    for (var b = 0; b < 64; b = b + 1) {
+        if (img_group(b) != g) {
+            continue;
+        }
+        count = count + 1.0;
+        let e = img_energy(b);
+        if (e <= 0.01) {
+            continue;
+        }
+        let d = img_diffuse(b);
+        let delta = a - img_angle(b);
+        sum = sum + e * (1.0 - d) * exp(-delta * delta * inv2s2) + e * d * 0.5;
+        diffuse = diffuse + d * e;
+        weight = weight + e;
+    }
+    return vec2<f32>(sum / max(count, 1.0), diffuse / max(weight, 1e-4));
+}
+
+fn glow(d: f32) -> f32 {
+    return exp(-d * d);
+}
+
+// Organico, come le forme di Bioma: nessun arco né tacca disegnati. Il palco
+// è un alone appena accennato, i diffusori due luci tenui ai suoi capi,
+// l'ascoltatore un nucleo. Ogni lobo è una cellula: un corpo appena
+// tinto e una membrana luminosa, nitida quanto il suono è localizzato,
+// sfumata quanto è diffuso. Verso la corda tutto svanisce invece di
+// essere tagliato. Ogni banda è una spora alla sua direzione, tanto più
+// lontana quanto è acuta, grande con l'energia, sfocata con la diffusività.
+fn shade(p: vec2<f32>) -> vec4<f32> {
+    let q = polar_q(p);
+    let rel = q - vec2<f32>(0.0, IMG_Y_OFFSET);
+    let rho = length(rel);
+    let a = atan2(rel.x, rel.y);
+    let unit = shader.size.y * 0.5;
+    // La base: svanisce sotto la corda, invece di un taglio.
+    let base = smoothstep(-0.06, 0.12, rel.y);
+    var rgb = vec3<f32>(0.0);
+
+    // Il palco: un alone tenue che si spegne verso il bordo, e i diffusori.
+    let stage = smoothstep(IMG_RADIUS + 0.10, IMG_RADIUS - 0.25, rho) * 0.035;
+    rgb = rgb + col_a() * stage * base;
+    for (var side = -1; side <= 1; side = side + 2) {
+        let at = vec2<f32>(f32(side) * IMG_RADIUS, 0.0);
+        rgb = rgb + col_a() * 0.22 * glow(length(rel - at) / 0.035);
+    }
+    // L'ascoltatore.
+    rgb = rgb + col_b() * 0.35 * glow(rho / 0.03);
+
+    // I tre lobi.
+    let fa = clamp(a, -PI * 0.5, PI * 0.5);
+    for (var g = 0; g < 3; g = g + 1) {
+        let c = mix(col_a(), col_b(), f32(g) * 0.5);
+        let l = lobe(g, fa);
+        let v = 1.0 - exp(-l.x * IMG_LOBE_KNEE);
+        if (v <= 0.002) {
+            continue;
+        }
+        let r = IMG_LOBE_MIN + v * (IMG_RADIUS - IMG_LOBE_MIN);
+        let bright = pow(v, IMG_LOBE_GAMMA);
+        // La membrana: più larga e morbida per il suono diffuso.
+        let width = 0.012 + l.y * 0.05;
+        let x = rho / max(r, 1e-4);
+        let body = smoothstep(1.0 + width / max(r, 0.05), 1.0 - width / max(r, 0.05), x) * (0.04 + 0.10 * x * x);
+        let membrane = glow((rho - r) / width) * (0.45 + v * 0.5);
+        rgb = rgb + c * bright * (body + membrane) * base;
+    }
+
+    // Le spore: una per banda.
+    for (var b = 0; b < 64; b = b + 1) {
+        let e = img_energy(b);
+        if (e <= 0.02) {
+            continue;
+        }
+        let d = img_diffuse(b);
+        let ang = img_angle(b);
+        let radius = 0.12 + (f32(b) / 63.0) * (IMG_RADIUS - 0.18);
+        let at = vec2<f32>(sin(ang), cos(ang)) * radius;
+        let size = (0.008 + e * 0.022) * (1.0 + d * 1.5);
+        let light = e * (1.0 - d * 0.6) * 0.9;
+        rgb = rgb + mix(col_a(), col_b(), f32(b) / 63.0) * light * glow(length(rel - at) / size) * base;
+    }
+    return vec4<f32>(rgb, clamp(max(rgb.r, max(rgb.g, rgb.b)), 0.0, 1.0));
+}

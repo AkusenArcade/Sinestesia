@@ -172,6 +172,32 @@ local function solid_values(): { number }
     return out
 end
 
+-- L'immagine stereo costa due trasformate in più: la si chiede a Genoma
+-- solo mentre Imaging è l'effetto scelto.
+do
+    local imaging_hold: any = nil
+    g.watch(function() return get("effect") == "imaging" end, function(on: boolean)
+        if on and not imaging_hold then
+            imaging_hold = spectrum:hold { imaging = true }
+        elseif not on and imaging_hold then
+            imaging_hold:release()
+            imaging_hold = nil
+        end
+    end)
+end
+local function imaging_values(): { number }
+    local az, diff, energy = spectrum.azimuth, spectrum.diffuseness, spectrum.energy
+    local out = table.create(204, 0)
+    for i = 1, 64 do
+        out[i] = az[i] or 0
+        out[64 + i] = diff[i] or 0
+        out[140 + i] = energy[i] or 0
+    end
+    colours_into(out)
+    out[135] = get("gain")
+    return out
+end
+
 local function tunnel_values(): { number }
     local out = table.create(140 + 26 * 35, 0)
     colours_into(out)
@@ -192,7 +218,7 @@ local EFFECTS = {
     { key = "radialspectrum", label = "Radiale Spettro", src = "effects/radial_spectrum.wgsl" },
     { key = "tunnel", label = "Tunnel", src = "effects/tunnel.wgsl", values = tunnel_values },
     { key = "solid", label = "Poliedro", compute = "effects/solid.wgsl", drawn = true, agents = solid.agents, values = solid_values },
-    { key = "imaging", label = "Imaging" },
+    { key = "imaging", label = "Imaging", src = "effects/imaging.wgsl", values = imaging_values },
     { key = "nebula", label = "Nebulosa", compute = "effects/nebula.wgsl", values = nebula_values },
 }
 local function effect_index(): number
