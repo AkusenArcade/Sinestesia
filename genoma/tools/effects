@@ -1,0 +1,16 @@
+#!/bin/sh
+# Compone gli shader degli effetti: effects/source/common.wgsli in testa a
+# ogni altro effects/source/<nome>.wgsli, scritto in effects/<nome>.wgsl
+# (WGSL non ha include). Da rilanciare dopo ogni modifica alle sorgenti.
+set -eu
+root="$(cd "$(dirname "$0")/../effects" && pwd)"
+for body in "$root"/source/*.wgsli; do
+    name="$(basename "$body" .wgsli)"
+    [ "$name" = common ] && continue
+    {
+        echo "// Generato da tools/effects: si modifica source/$name.wgsli o source/common.wgsli."
+        cat "$root/source/common.wgsli"
+        echo
+        cat "$body"
+    } > "$root/$name.wgsl"
+done

@@ -1,0 +1,26 @@
+// Barre speculari: centro = basse, bordi = alte; metà sinistra il canale
+// sinistro. Base trasparente, cima opaca, gradiente A → B.
+fn shade(p: vec2<f32>) -> vec4<f32> {
+    let s = shader.size;
+    let x = p.x / s.x * 2.0 - 1.0;
+    let y = 1.0 - p.y / s.y;
+    let slot = 1.0 / 64.0;
+    let ax = abs(x);
+    let i = min(i32(floor(ax / slot)), 63);
+    let local = ax / slot - f32(i);
+    var h: f32;
+    if (x >= 0.0) {
+        h = band(64 + i);
+    } else {
+        h = band(i);
+    }
+    if (h <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    let slot_px = s.x * 0.5 * slot;
+    let side = clamp(min(local - 0.12, 0.88 - local) * slot_px + 0.5, 0.0, 1.0);
+    let top = clamp((h - y) * s.y + 0.5, 0.0, 1.0);
+    let t = clamp(y / h, 0.0, 1.0);
+    let a = t * side * top;
+    return vec4<f32>(mix(col_a(), col_b(), t) * a, a);
+}

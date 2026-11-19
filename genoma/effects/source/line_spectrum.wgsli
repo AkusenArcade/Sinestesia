@@ -1,0 +1,18 @@
+// Linea Spettro: riempimento tenue, alone e linea da 1 px nel colore A,
+// visibili quanto il picco.
+const FILL_ALPHA: f32 = 0.20;
+
+fn shade(p: vec2<f32>) -> vec4<f32> {
+    let s = shader.size;
+    let x = p.x / s.x * 2.0 - 1.0;
+    let y = 1.0 - p.y / s.y;
+    let h = line_curve(x);
+    var rgb = vec3<f32>(0.0);
+    var a = 0.0;
+    if (h > 0.0 && y <= h) {
+        let t = clamp(y / h, 0.0, 1.0);
+        a = FILL_ALPHA * t;
+        rgb = mix(col_a(), col_b(), t) * a;
+    }
+    return neon(rgb, a, line_distance(p, neon_reach() + 2.0));
+}

@@ -1,0 +1,42 @@
+// Radiale: un raggio per banda, il destro a destra dall'alto in basso, il
+// sinistro a sinistra; interno trasparente, punta opaca.
+fn shade(p: vec2<f32>) -> vec4<f32> {
+    let s = shader.size;
+    let q = polar_q(p);
+    let r = length(q);
+    if (r < RADIAL_INNER) {
+        return vec4<f32>(0.0);
+    }
+    let theta = atan2(q.y, q.x);
+    var u: f32;
+    var right = true;
+    if (q.x >= 0.0) {
+        u = (PI * 0.5 - theta) / PI * 63.0;
+    } else {
+        var tl = theta;
+        if (tl < 0.0) {
+            tl = tl + 2.0 * PI;
+        }
+        u = (tl - PI * 0.5) / PI * 63.0;
+        right = false;
+    }
+    let i = i32(clamp(round(u), 0.0, 63.0));
+    var h: f32;
+    if (right) {
+        h = band(64 + i);
+    } else {
+        h = band(i);
+    }
+    if (h <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    let half_w = (PI / 64.0) * 0.40;
+    let dtheta = abs(u - f32(i)) * PI / 63.0;
+    let px = s.y * 0.5;
+    let side = clamp((half_w - dtheta) * r * px + 0.5, 0.0, 1.0);
+    let r1 = RADIAL_INNER + h * RADIAL_SPAN;
+    let top = clamp((r1 - r) * px + 0.5, 0.0, 1.0);
+    let t = clamp((r - RADIAL_INNER) / max(r1 - RADIAL_INNER, 1e-4), 0.0, 1.0);
+    let a = t * side * top;
+    return vec4<f32>(mix(col_a(), col_b(), t) * a, a);
+}

@@ -1,0 +1,19 @@
+// Radiale Spettro: la curva chiusa attorno all'anello interno, riempimento
+// tenue verso l'interno, alone e linea da 1 px.
+const FILL_ALPHA: f32 = 0.20;
+
+fn shade(p: vec2<f32>) -> vec4<f32> {
+    let s = shader.size;
+    let q = polar_q(p);
+    let r = length(q);
+    let theta = atan2(q.y, q.x);
+    let rc = ring_radius(theta);
+    var rgb = vec3<f32>(0.0);
+    var a = 0.0;
+    if (r >= RADIAL_INNER && r <= rc) {
+        let t = clamp((r - RADIAL_INNER) / max(rc - RADIAL_INNER, 1e-4), 0.0, 1.0);
+        a = FILL_ALPHA * t;
+        rgb = mix(col_a(), col_b(), t) * a;
+    }
+    return neon(rgb, a, ring_distance(p, neon_reach() + 2.0));
+}

@@ -1,0 +1,14 @@
+// Linea: l'area sotto la curva speculare, base trasparente, cima opaca.
+fn shade(p: vec2<f32>) -> vec4<f32> {
+    let s = shader.size;
+    let x = p.x / s.x * 2.0 - 1.0;
+    let y = 1.0 - p.y / s.y;
+    let h = line_curve(x);
+    if (h <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    let cover = clamp((h - y) * s.y + 0.5, 0.0, 1.0);
+    let t = clamp(y / h, 0.0, 1.0);
+    let a = t * cover;
+    return vec4<f32>(mix(col_a(), col_b(), t) * a, a);
+}
