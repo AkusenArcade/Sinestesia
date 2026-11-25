@@ -67,6 +67,21 @@ end
 -- Il vetro di una cella, come in Bioma (cell.opacity 0,72).
 function M.glass(): string return g.colour.alpha(M.cell(), 0.72) end
 
+-- Quanto è tondo il desktop: il RADIUS di Bioma, da 0 a 1 del raggio proprio
+-- di ogni superficie. Il file dice quello di un controllo alto 32; senza un
+-- desktop da seguire, tutto.
+local CONTROL = 16
+function M.roundness(): number
+    local d = theme.desktop()
+    local r = d and d.sizes and d.sizes.radius
+    return if type(r) == "number" then math.clamp(r / CONTROL, 0, 1) else 1
+end
+function M.shaped(radius: number): number return radius * M.roundness() end
+-- Per il `radius` di un nodo.
+function M.round(radius: number): () -> number
+    return function(): number return M.shaped(radius) end
+end
+
 -- Le misure di Bioma alla densità normale.
 M.cell_height = 40
 M.radius_panel = 20
